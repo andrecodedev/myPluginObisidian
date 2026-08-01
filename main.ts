@@ -1,18 +1,7 @@
 import { App, Modal, Notice, Plugin } from "obsidian";
 
-interface DocLink {
-  docId: string;
-  docUrl: string;
-  linkedAt: number;
-}
-
-interface GoogleDocsHubData {
-  links: Record<string, DocLink>;
-}
-
-const DEFAULT_DATA: GoogleDocsHubData = {
-  links: {},
-};
+const FRONTMATTER_DOC_ID_KEY = "google_doc_id";
+const FRONTMATTER_DOC_URL_KEY = "google_doc_url";
 
 function extractDocId(url: string): string | null {
   const match = url.match(/\/document\/d\/([a-zA-Z0-9_-]+)/);
@@ -63,11 +52,7 @@ class LinkDocModal extends Modal {
 }
 
 export default class GoogleDocsHubPlugin extends Plugin {
-  data: GoogleDocsHubData;
-
   async onload() {
-    this.data = Object.assign({}, DEFAULT_DATA, await this.loadData());
-
     this.addCommand({
       id: "connect-google-account",
       name: "Connect Google account",
@@ -101,13 +86,11 @@ export default class GoogleDocsHubPlugin extends Plugin {
             return;
           }
 
-          this.data.links[file.path] = {
-            docId,
-            docUrl: url,
-            linkedAt: Date.now(),
-          };
+          await this.app.fileManager.processFrontMatter(file, (frontmatter) => {
+            frontmatter[FRONTMATTER_DOC_ID_KEY] = docId;
+            frontmatter[FRONTMATTER_DOC_URL_KEY] = url;
+          });
 
-          await this.saveData(this.data);
           new Notice(`Nota vinculada ao Doc ${docId}`);
         }).open();
       },
