@@ -33,9 +33,247 @@ interface TokenSet {
   expiresAt: number;
 }
 
+interface InlineToken {
+  text: string;
+  bold?: boolean;
+  italic?: boolean;
+  code?: boolean;
+  link?: string;
+}
+
+type MarkdownBlock =
+  | { type: "heading"; level: number; tokens: InlineToken[] }
+  | { type: "bullet"; tokens: InlineToken[] }
+  | { type: "numbered"; tokens: InlineToken[] }
+  | { type: "paragraph"; tokens: InlineToken[] }
+  | { type: "code"; text: string }
+  | { type: "blank" };
+
+const HEADING_NAMED_STYLES = ["HEADING_1", "HEADING_2", "HEADING_3", "HEADING_4", "HEADING_5", "HEADING_6"];
+const MONOSPACE_FONT_FAMILY = "Courier New";
+
 function extractDocId(url: string): string | null {
   const match = url.match(/\/document\/d\/([a-zA-Z0-9_-]+)/);
   return match ? match[1] : null;
+}
+
+// Le uma linha de Markdown e quebra em pedacos com o estilo de cada um (negrito, italico, codigo, link)
+function parseInlineSpans(line: string): InlineToken[] {
+  const tokens: InlineToken[] = [];
+  let i = 0;
+  const n = line.length;
+
+  while (i < n) {
+    const rest = line.slice(i);
+    let m: RegExpExecArray | null;
+
+    if ((m = /^`([^`]+)`/.exec(rest))) {
+      tokens.push({ text: m[1], code: true });
+      i += m[0].length;
+      continue;
+    }
+
+    if ((m = /^\[([^\]]+)\]\(([^)]+)\)/.exec(rest))) {
+      tokens.push({ text: m[1], link: m[2] });
+      i += m[0].length;
+      continue;
+    }
+
+    if ((m = /^(?:\*\*\*([^*]+)\*\*\*|___([^_]+)___)/.exec(rest))) {
+      tokens.push({ text: (m[1] ?? m[2]) as string, bold: true, italic: true });
+      i += m[0].length;
+      continue;
+    }
+
+    if ((m = /^(?:\*\*([^*]+)\*\*|__([^_]+)__)/.exec(rest))) {
+      tokens.push({ text: (m[1] ?? m[2]) as string, bold: true });
+      i += m[0].length;
+      continue;
+    }
+
+    if ((m = /^(?:\*([^*]+)\*|_([^_]+)_)/.exec(rest))) {
+      tokens.push({ text: (m[1] ?? m[2]) as string, italic: true });
+      i += m[0].length;
+      continue;
+    }
+
+    const nextSpecial = rest.slice(1).search(/[`\[*_]/);
+    const takeLen = nextSpecial === -1 ? rest.length : nextSpecial + 1;
+    tokens.push({ text: rest.slice(0, takeLen) });
+    i += takeLen;
+  }
+
+  return tokens;
+}
+
+// Quebra o Markdown inteiro em blocos: titulo, lista, paragrafo, bloco de codigo, linha em branco
+function parseMarkdownBlocks(markdown: string): MarkdownBlock[] {
+  const lines = markdown.split("\n");
+  const blocks: MarkdownBlock[] = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    if (/^```/.test(line.trim())) {
+      const codeLines: string[] = [];
+      i++;
+      while (i < lines.length && !/^```/.test(lines[i].trim())) {
+        codeLines.push(lines[i]);
+        i++;
+      }
+      i++; // pula a cerca de fechamento
+      blocks.push({ type: "code", text: codeLines.join("\n") });
+      continue;
+    }
+
+    const headingMatch = /^(#{1,6})\s+(.*)$/.exec(line);
+    if (headingMatch) {
+      blocks.push({ type: "heading", level: headingMatch[1].length, tokens: parseInlineSpans(headingMatch[2]) });
+      i++;
+      continue;
+    }
+
+    const bulletMatch = /^[-*]\s+(.*)$/.exec(line);
+    if (bulletMatch) {
+      blocks.push({ type: "bullet", tokens: parseInlineSpans(bulletMatch[1]) });
+      i++;
+      continue;
+    }
+
+    const numberedMatch = /^\d+\.\s+(.*)$/.exec(line);
+    if (numberedMatch) {
+      blocks.push({ type: "numbered", tokens: parseInlineSpans(numberedMatch[1]) });
+      i++;
+      continue;
+    }
+
+    if (line.trim() === "") {
+      blocks.push({ type: "blank" });
+      i++;
+      continue;
+    }
+
+    blocks.push({ type: "paragraph", tokens: parseInlineSpans(line) });
+    i++;
+  }
+
+  return blocks;
+}
+
+// Converte os blocos em: (1) o texto puro a inserir e (2) os comandos de formatacao com seus indices exatos
+function buildDocRequestsFromMarkdown(markdown: string): { text: string; styleRequests: unknown[] } {
+  const blocks = parseMarkdownBlocks(markdown);
+  let text = "";
+  let cursor = 1; // no Google Docs, o corpo do documento comeca no indice 1
+  const styleRequests: unknown[] = [];
+
+  let bulletRunStart: number | null = null;
+  let bulletRunOrdered = false;
+
+  const flushBulletRun = (endIndex: number) => {
+    if (bulletRunStart === null) return;
+    styleRequests.push({
+      createParagraphBullets: {
+        range: { startIndex: bulletRunStart, endIndex },
+        bulletPreset: bulletRunOrdered ? "NUMBERED_DECIMAL_ALPHA_ROMAN" : "BULLET_DISC_CIRCLE_SQUARE",
+      },
+    });
+    bulletRunStart = null;
+  };
+
+  for (const block of blocks) {
+    const isListItem = block.type === "bullet" || block.type === "numbered";
+    const isOrdered = block.type === "numbered";
+
+    if (bulletRunStart !== null && (!isListItem || isOrdered !== bulletRunOrdered)) {
+      flushBulletRun(cursor);
+    }
+
+    if (block.type === "blank") {
+      text += "\n";
+      cursor += 1;
+      continue;
+    }
+
+    if (block.type === "code") {
+      const blockStart = cursor;
+      text += block.text;
+      cursor += block.text.length;
+      if (block.text.length > 0) {
+        styleRequests.push({
+          updateTextStyle: {
+            range: { startIndex: blockStart, endIndex: cursor },
+            textStyle: { weightedFontFamily: { fontFamily: MONOSPACE_FONT_FAMILY } },
+            fields: "weightedFontFamily",
+          },
+        });
+      }
+      text += "\n";
+      cursor += 1;
+      continue;
+    }
+
+    const paragraphStart = cursor;
+
+    for (const token of block.tokens) {
+      const spanStart = cursor;
+      text += token.text;
+      cursor += token.text.length;
+
+      const fields: string[] = [];
+      const textStyle: Record<string, unknown> = {};
+
+      if (token.bold) {
+        fields.push("bold");
+        textStyle.bold = true;
+      }
+      if (token.italic) {
+        fields.push("italic");
+        textStyle.italic = true;
+      }
+      if (token.code) {
+        fields.push("weightedFontFamily");
+        textStyle.weightedFontFamily = { fontFamily: MONOSPACE_FONT_FAMILY };
+      }
+      if (token.link) {
+        fields.push("link");
+        textStyle.link = { url: token.link };
+      }
+
+      if (fields.length > 0 && token.text.length > 0) {
+        styleRequests.push({
+          updateTextStyle: {
+            range: { startIndex: spanStart, endIndex: cursor },
+            textStyle,
+            fields: fields.join(","),
+          },
+        });
+      }
+    }
+
+    text += "\n";
+    cursor += 1;
+
+    if (block.type === "heading") {
+      styleRequests.push({
+        updateParagraphStyle: {
+          range: { startIndex: paragraphStart, endIndex: cursor },
+          paragraphStyle: { namedStyleType: HEADING_NAMED_STYLES[block.level - 1] },
+          fields: "namedStyleType",
+        },
+      });
+    }
+
+    if (isListItem && bulletRunStart === null) {
+      bulletRunStart = paragraphStart;
+      bulletRunOrdered = isOrdered;
+    }
+  }
+
+  flushBulletRun(cursor);
+
+  return { text, styleRequests };
 }
 
 function base64UrlEncode(buffer: Buffer): string {
@@ -213,12 +451,14 @@ function extractPlainTextFromDoc(doc: any): string {
   return text;
 }
 
-async function publishNoteToDoc(plugin: GoogleDocsHubPlugin, docId: string, content: string): Promise<void> {
+async function publishNoteToDoc(plugin: GoogleDocsHubPlugin, docId: string, markdown: string): Promise<void> {
   const doc = await fetchGoogleDoc(plugin, docId);
 
   const bodyContent = doc.body?.content ?? [];
   const lastElement = bodyContent[bodyContent.length - 1];
   const endIndex = lastElement?.endIndex ?? 1;
+
+  const { text, styleRequests } = buildDocRequestsFromMarkdown(markdown);
 
   const requests: unknown[] = [];
 
@@ -226,8 +466,9 @@ async function publishNoteToDoc(plugin: GoogleDocsHubPlugin, docId: string, cont
     requests.push({ deleteContentRange: { range: { startIndex: 1, endIndex: endIndex - 1 } } });
   }
 
-  if (content.length > 0) {
-    requests.push({ insertText: { location: { index: 1 }, text: content } });
+  if (text.length > 0) {
+    requests.push({ insertText: { location: { index: 1 }, text } });
+    requests.push(...styleRequests);
   }
 
   if (requests.length === 0) return;
