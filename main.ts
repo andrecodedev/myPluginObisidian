@@ -1,7 +1,73 @@
-import { Notice, Plugin } from "obsidian";
+import { App, Modal, Notice, Plugin } from "obsidian";
+
+interface DocLink {
+  docId: string;
+  docUrl: string;
+  linkedAt: number;
+}
+
+interface GoogleDocsHubData {
+  links: Record<string, DocLink>;
+}
+
+const DEFAULT_DATA: GoogleDocsHubData = {
+  links: {},
+};
+
+function extractDocId(url: string): string | null {
+  const match = url.match(/\/document\/d\/([a-zA-Z0-9_-]+)/);
+  return match ? match[1] : null;
+}
+
+class LinkDocModal extends Modal {
+  private onSubmit: (url: string) => void;
+
+  constructor(app: App, onSubmit: (url: string) => void) {
+    super(app);
+    this.onSubmit = onSubmit;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.createEl("h2", { text: "Link existing Google Doc" });
+    contentEl.createEl("p", {
+      text: "Cole a URL completa do Google Doc que voce quer vincular a esta nota.",
+    });
+
+    const input = contentEl.createEl("input", {
+      type: "text",
+      placeholder: "https://docs.google.com/document/d/....",
+    });
+    input.style.width = "100%";
+    input.focus();
+
+    const submit = () => {
+      const value = input.value.trim();
+      if (!value) return;
+      this.onSubmit(value);
+      this.close();
+    };
+
+    input.addEventListener("keydown", (evt: KeyboardEvent) => {
+      if (evt.key === "Enter") submit();
+    });
+
+    const buttonRow = contentEl.createDiv({ cls: "modal-button-container" });
+    const button = buttonRow.createEl("button", { text: "Link", cls: "mod-cta" });
+    button.addEventListener("click", submit);
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
 
 export default class GoogleDocsHubPlugin extends Plugin {
+  data: GoogleDocsHubData;
+
   async onload() {
+    this.data = Object.assign({}, DEFAULT_DATA, await this.loadData());
+
     this.addCommand({
       id: "connect-google-account",
       name: "Connect Google account",
@@ -22,7 +88,28 @@ export default class GoogleDocsHubPlugin extends Plugin {
       id: "link-existing-doc",
       name: "Link existing Doc",
       callback: () => {
-        new Notice("Google Docs Hub: Link existing Doc (ainda nao implementado)");
+        const file = this.app.workspace.getActiveFile();
+        if (!file) {
+          new Notice("Abra uma nota antes de vincular um Google Doc.");
+          return;
+        }
+
+        new LinkDocModal(this.app, async (url) => {
+          const docId = extractDocId(url);
+          if (!docId) {
+            new Notice("URL invalida. Cole o link completo do Google Doc.");
+            return;
+          }
+
+          this.data.links[file.path] = {
+            docId,
+            docUrl: url,
+            linkedAt: Date.now(),
+          };
+
+          await this.saveData(this.data);
+          new Notice(`Nota vinculada ao Doc ${docId}`);
+        }).open();
       },
     });
 
