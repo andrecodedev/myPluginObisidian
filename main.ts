@@ -1,4 +1,4 @@
-import { App, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile } from "obsidian";
+import { App, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile } from "obsidian";
 import { randomBytes, createHash } from "crypto";
 import * as http from "http";
 import { shell } from "electron";
@@ -1008,6 +1008,75 @@ class MergeReviewModal extends Modal {
   }
 }
 
+// Logica compartilhada do Publish note: chamada tanto pelo comando (Ctrl+P) quanto pelo botao na nota
+async function publishNoteCommand(plugin: GoogleDocsHubPlugin, file: TFile): Promise<void> {
+  const frontmatter = plugin.app.metadataCache.getFileCache(file)?.frontmatter;
+  const docId = frontmatter?.[FRONTMATTER_DOC_ID_KEY];
+  if (!docId) {
+    new Notice("Essa nota ainda nao esta vinculada a um Doc. Rode Link existing Doc primeiro.");
+    return;
+  }
+
+  try {
+    const rawContent = await plugin.app.vault.read(file);
+    const content = rawContent.replace(FRONTMATTER_BLOCK_PATTERN, "");
+    const doc = await fetchGoogleDoc(plugin, docId);
+
+    const lastRevision = frontmatter?.[FRONTMATTER_LAST_SYNCED_REVISION_KEY];
+    const lastHash = frontmatter?.[FRONTMATTER_LAST_SYNCED_HASH_KEY];
+    const hasPriorSync = Boolean(lastRevision && lastHash);
+    const remoteChanged = hasPriorSync && doc.revisionId !== lastRevision;
+
+    if (remoteChanged) {
+      const remoteContent = convertDocToMarkdown(doc);
+      new MergeReviewModal(plugin.app, content, remoteContent, (merged) => {
+        applyMergedContent(plugin, file, docId, merged);
+      }).open();
+      return;
+    }
+
+    await runPublishFlow(plugin, file, doc, docId, content);
+  } catch (err) {
+    console.error(err);
+    new Notice(`Falha ao publicar: ${(err as Error).message}`);
+  }
+}
+
+// Logica compartilhada do Sync now: chamada tanto pelo comando (Ctrl+P) quanto pelo botao na nota
+async function syncNowCommand(plugin: GoogleDocsHubPlugin, file: TFile): Promise<void> {
+  const frontmatter = plugin.app.metadataCache.getFileCache(file)?.frontmatter;
+  const docId = frontmatter?.[FRONTMATTER_DOC_ID_KEY];
+  if (!docId) {
+    new Notice("Essa nota ainda nao esta vinculada a um Doc. Rode Link existing Doc primeiro.");
+    return;
+  }
+
+  try {
+    const rawContent = await plugin.app.vault.read(file);
+    const localContent = rawContent.replace(FRONTMATTER_BLOCK_PATTERN, "");
+    const localHash = hashContent(localContent);
+    const doc = await fetchGoogleDoc(plugin, docId);
+
+    const lastRevision = frontmatter?.[FRONTMATTER_LAST_SYNCED_REVISION_KEY];
+    const lastHash = frontmatter?.[FRONTMATTER_LAST_SYNCED_HASH_KEY];
+    const hasPriorSync = Boolean(lastRevision && lastHash);
+    const localChanged = hasPriorSync && localHash !== lastHash;
+
+    if (localChanged) {
+      const remoteContent = convertDocToMarkdown(doc);
+      new MergeReviewModal(plugin.app, localContent, remoteContent, (merged) => {
+        applyMergedContent(plugin, file, docId, merged);
+      }).open();
+      return;
+    }
+
+    await runSyncFlow(plugin, file, doc);
+  } catch (err) {
+    console.error(err);
+    new Notice(`Falha ao sincronizar: ${(err as Error).message}`);
+  }
+}
+
 class LinkDocModal extends Modal {
   private onSubmit: (url: string) => void;
 
@@ -1100,6 +1169,7 @@ class GoogleDocsHubSettingTab extends PluginSettingTab {
 
 export default class GoogleDocsHubPlugin extends Plugin {
   settings: GoogleDocsHubSettings;
+  private docActionsByView = new Map<MarkdownView, HTMLElement[]>();
 
   async onload() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
@@ -1134,43 +1204,13 @@ export default class GoogleDocsHubPlugin extends Plugin {
     this.addCommand({
       id: "publish-note",
       name: "Publish note",
-      callback: async () => {
+      callback: () => {
         const file = this.app.workspace.getActiveFile();
         if (!file) {
           new Notice("Abra uma nota antes de publicar.");
           return;
         }
-
-        const frontmatter = this.app.metadataCache.getFileCache(file)?.frontmatter;
-        const docId = frontmatter?.[FRONTMATTER_DOC_ID_KEY];
-        if (!docId) {
-          new Notice("Essa nota ainda nao esta vinculada a um Doc. Rode Link existing Doc primeiro.");
-          return;
-        }
-
-        try {
-          const rawContent = await this.app.vault.read(file);
-          const content = rawContent.replace(FRONTMATTER_BLOCK_PATTERN, "");
-          const doc = await fetchGoogleDoc(this, docId);
-
-          const lastRevision = frontmatter?.[FRONTMATTER_LAST_SYNCED_REVISION_KEY];
-          const lastHash = frontmatter?.[FRONTMATTER_LAST_SYNCED_HASH_KEY];
-          const hasPriorSync = Boolean(lastRevision && lastHash);
-          const remoteChanged = hasPriorSync && doc.revisionId !== lastRevision;
-
-          if (remoteChanged) {
-            const remoteContent = convertDocToMarkdown(doc);
-            new MergeReviewModal(this.app, content, remoteContent, (merged) => {
-              applyMergedContent(this, file, docId, merged);
-            }).open();
-            return;
-          }
-
-          await runPublishFlow(this, file, doc, docId, content);
-        } catch (err) {
-          console.error(err);
-          new Notice(`Falha ao publicar: ${(err as Error).message}`);
-        }
+        publishNoteCommand(this, file);
       },
     });
 
@@ -1204,51 +1244,62 @@ export default class GoogleDocsHubPlugin extends Plugin {
     this.addCommand({
       id: "sync-now",
       name: "Sync now",
-      callback: async () => {
+      callback: () => {
         const file = this.app.workspace.getActiveFile();
         if (!file) {
           new Notice("Abra uma nota antes de sincronizar.");
           return;
         }
-
-        const frontmatter = this.app.metadataCache.getFileCache(file)?.frontmatter;
-        const docId = frontmatter?.[FRONTMATTER_DOC_ID_KEY];
-        if (!docId) {
-          new Notice("Essa nota ainda nao esta vinculada a um Doc. Rode Link existing Doc primeiro.");
-          return;
-        }
-
-        try {
-          const rawContent = await this.app.vault.read(file);
-          const localContent = rawContent.replace(FRONTMATTER_BLOCK_PATTERN, "");
-          const localHash = hashContent(localContent);
-          const doc = await fetchGoogleDoc(this, docId);
-
-          const lastRevision = frontmatter?.[FRONTMATTER_LAST_SYNCED_REVISION_KEY];
-          const lastHash = frontmatter?.[FRONTMATTER_LAST_SYNCED_HASH_KEY];
-          const hasPriorSync = Boolean(lastRevision && lastHash);
-          const localChanged = hasPriorSync && localHash !== lastHash;
-
-          if (localChanged) {
-            const remoteContent = convertDocToMarkdown(doc);
-            new MergeReviewModal(this.app, localContent, remoteContent, (merged) => {
-              applyMergedContent(this, file, docId, merged);
-            }).open();
-            return;
-          }
-
-          await runSyncFlow(this, file, doc);
-        } catch (err) {
-          console.error(err);
-          new Notice(`Falha ao sincronizar: ${(err as Error).message}`);
-        }
+        syncNowCommand(this, file);
       },
     });
+
+    // Botoes na barra de titulo da nota (so aparecem quando a nota tem um Doc vinculado)
+    this.registerEvent(this.app.workspace.on("active-leaf-change", () => this.refreshDocActions()));
+    this.registerEvent(this.app.workspace.on("file-open", () => this.refreshDocActions()));
+    this.registerEvent(
+      this.app.metadataCache.on("changed", (file) => {
+        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+        if (view && view.file === file) this.refreshDocActions();
+      })
+    );
+    this.app.workspace.onLayoutReady(() => this.refreshDocActions());
+  }
+
+  private refreshDocActions() {
+    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+    if (!view) return;
+
+    const existing = this.docActionsByView.get(view);
+    if (existing) {
+      existing.forEach((el) => el.remove());
+      this.docActionsByView.delete(view);
+    }
+
+    const file = view.file;
+    if (!file) return;
+
+    const docId = this.app.metadataCache.getFileCache(file)?.frontmatter?.[FRONTMATTER_DOC_ID_KEY];
+    if (!docId) return;
+
+    const actions: HTMLElement[] = [
+      view.addAction("upload-cloud", "Publish note (Google Docs Hub)", () => {
+        publishNoteCommand(this, file);
+      }),
+      view.addAction("download-cloud", "Sync now (Google Docs Hub)", () => {
+        syncNowCommand(this, file);
+      }),
+    ];
+
+    this.docActionsByView.set(view, actions);
   }
 
   async saveSettings() {
     await this.saveData(this.settings);
   }
 
-  onunload() {}
+  onunload() {
+    this.docActionsByView.forEach((actions) => actions.forEach((el) => el.remove()));
+    this.docActionsByView.clear();
+  }
 }
