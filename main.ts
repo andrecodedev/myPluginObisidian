@@ -1,4 +1,4 @@
-import { App, Modal, Notice, Plugin, PluginSettingTab, Setting } from "obsidian";
+import { App, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile } from "obsidian";
 import { randomBytes, createHash } from "crypto";
 import * as http from "http";
 import { shell } from "electron";
@@ -64,6 +64,84 @@ function extractDocId(url: string): string | null {
 // "Impressao digital" curta do conteudo, pra saber se a nota mudou desde a ultima sincronizacao
 function hashContent(content: string): string {
   return createHash("sha256").update(content).digest("hex").slice(0, 16);
+}
+
+type DiffLine = { type: "same" | "removed" | "added"; text: string };
+
+// Diff classico por LCS (mesma familia de algoritmo que o git usa): compara linha por linha
+function diffLines(a: string[], b: string[]): DiffLine[] {
+  const n = a.length;
+  const m = b.length;
+  const dp: number[][] = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+
+  const result: DiffLine[] = [];
+  let i = 0;
+  let j = 0;
+
+  while (i < n && j < m) {
+    if (a[i] === b[j]) {
+      result.push({ type: "same", text: a[i] });
+      i++;
+      j++;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      result.push({ type: "removed", text: a[i] });
+      i++;
+    } else {
+      result.push({ type: "added", text: b[j] });
+      j++;
+    }
+  }
+
+  while (i < n) {
+    result.push({ type: "removed", text: a[i] });
+    i++;
+  }
+  while (j < m) {
+    result.push({ type: "added", text: b[j] });
+    j++;
+  }
+
+  return result;
+}
+
+type MergeHunk = { kind: "same"; lines: string[] } | { kind: "change"; localLines: string[]; remoteLines: string[] };
+
+// Agrupa o diff em trechos: "igual" (contexto) e "mudanca" (onde local e remoto divergem)
+function groupIntoHunks(diff: DiffLine[]): MergeHunk[] {
+  const hunks: MergeHunk[] = [];
+  let i = 0;
+
+  while (i < diff.length) {
+    if (diff[i].type === "same") {
+      const lines: string[] = [];
+      while (i < diff.length && diff[i].type === "same") {
+        lines.push(diff[i].text);
+        i++;
+      }
+      hunks.push({ kind: "same", lines });
+      continue;
+    }
+
+    const localLines: string[] = [];
+    const remoteLines: string[] = [];
+    while (i < diff.length && diff[i].type !== "same") {
+      if (diff[i].type === "removed") {
+        localLines.push(diff[i].text);
+      } else {
+        remoteLines.push(diff[i].text);
+      }
+      i++;
+    }
+    hunks.push({ kind: "change", localLines, remoteLines });
+  }
+
+  return hunks;
 }
 
 // Le uma linha de Markdown e quebra em pedacos com o estilo de cada um (negrito, italico, codigo, link)
@@ -723,74 +801,206 @@ async function publishNoteToDoc(plugin: GoogleDocsHubPlugin, doc: any, docId: st
   }
 }
 
-// Decide se Publish/Sync pode rodar direto, ou se precisa avisar sobre divergencia antes
-async function guardAgainstConflict(
+// Publica sem nenhum conflito pendente: escreve no Doc e atualiza o "carimbo" de ultima sincronizacao
+async function runPublishFlow(
   plugin: GoogleDocsHubPlugin,
-  frontmatter: Record<string, unknown> | undefined,
+  file: TFile,
   doc: any,
-  localHash: string,
-  kind: "publish" | "sync",
-  run: () => Promise<void>
+  docId: string,
+  content: string
 ): Promise<void> {
-  const lastRevision = frontmatter?.[FRONTMATTER_LAST_SYNCED_REVISION_KEY];
-  const lastHash = frontmatter?.[FRONTMATTER_LAST_SYNCED_HASH_KEY];
-  const hasPriorSync = Boolean(lastRevision && lastHash);
+  new Notice("Publicando nota no Google Docs...");
+  try {
+    await publishNoteToDoc(plugin, doc, docId, content);
 
-  if (!hasPriorSync) {
-    await run();
-    return;
+    const updatedDoc = await fetchGoogleDoc(plugin, docId);
+    const localHash = hashContent(content);
+    await plugin.app.fileManager.processFrontMatter(file, (fm) => {
+      fm[FRONTMATTER_LAST_SYNCED_REVISION_KEY] = updatedDoc.revisionId;
+      fm[FRONTMATTER_LAST_SYNCED_HASH_KEY] = localHash;
+    });
+
+    new Notice("Nota publicada com sucesso no Google Docs.");
+  } catch (err) {
+    console.error(err);
+    new Notice(`Falha ao publicar: ${(err as Error).message}`);
   }
-
-  const remoteChanged = doc.revisionId !== lastRevision;
-  const localChanged = localHash !== lastHash;
-  const shouldWarn = kind === "publish" ? remoteChanged : localChanged;
-
-  if (!shouldWarn) {
-    await run();
-    return;
-  }
-
-  const message =
-    remoteChanged && localChanged
-      ? "Tanto a nota quanto o Google Doc mudaram desde a ultima sincronizacao. Continuar vai sobrescrever um dos dois lados por completo."
-      : kind === "publish"
-      ? "O Google Doc foi alterado desde a ultima sincronizacao (por voce ou outra pessoa). Publicar agora vai apagar essas mudancas."
-      : "Esta nota tem alteracoes que ainda nao foram publicadas. Sincronizar agora vai substitui-las pelo conteudo do Doc.";
-
-  new ConflictModal(plugin.app, message, () => {
-    run();
-  }).open();
 }
 
-// Janela de aviso quando o Doc e a nota divergiram desde a ultima sincronizacao (conflito)
-class ConflictModal extends Modal {
-  private message: string;
-  private onConfirm: () => void;
+// Sincroniza sem nenhum conflito pendente: traz o Doc pra nota e atualiza o "carimbo" de ultima sincronizacao
+async function runSyncFlow(plugin: GoogleDocsHubPlugin, file: TFile, doc: any): Promise<void> {
+  new Notice("Trazendo o conteudo do Google Docs para a nota...");
+  try {
+    const docText = convertDocToMarkdown(doc);
+    await plugin.app.vault.process(file, (data) => {
+      const frontmatterMatch = data.match(FRONTMATTER_BLOCK_PATTERN);
+      const frontmatterBlock = frontmatterMatch ? frontmatterMatch[0] : "";
+      return frontmatterBlock + docText;
+    });
 
-  constructor(app: App, message: string, onConfirm: () => void) {
+    const newHash = hashContent(docText);
+    await plugin.app.fileManager.processFrontMatter(file, (fm) => {
+      fm[FRONTMATTER_LAST_SYNCED_REVISION_KEY] = doc.revisionId;
+      fm[FRONTMATTER_LAST_SYNCED_HASH_KEY] = newHash;
+    });
+
+    new Notice("Nota atualizada com o conteudo do Google Docs.");
+  } catch (err) {
+    console.error(err);
+    new Notice(`Falha ao sincronizar: ${(err as Error).message}`);
+  }
+}
+
+// Aplica o resultado de uma mesclagem manual nos dois lados (nota E Doc), pra ficarem consistentes
+async function applyMergedContent(
+  plugin: GoogleDocsHubPlugin,
+  file: TFile,
+  docId: string,
+  mergedContent: string
+): Promise<void> {
+  new Notice("Aplicando a versao revisada na nota e no Google Docs...");
+  try {
+    const doc = await fetchGoogleDoc(plugin, docId);
+    await publishNoteToDoc(plugin, doc, docId, mergedContent);
+
+    await plugin.app.vault.process(file, (data) => {
+      const frontmatterMatch = data.match(FRONTMATTER_BLOCK_PATTERN);
+      const frontmatterBlock = frontmatterMatch ? frontmatterMatch[0] : "";
+      return frontmatterBlock + mergedContent;
+    });
+
+    const updatedDoc = await fetchGoogleDoc(plugin, docId);
+    const mergedHash = hashContent(mergedContent);
+    await plugin.app.fileManager.processFrontMatter(file, (fm) => {
+      fm[FRONTMATTER_LAST_SYNCED_REVISION_KEY] = updatedDoc.revisionId;
+      fm[FRONTMATTER_LAST_SYNCED_HASH_KEY] = mergedHash;
+    });
+
+    new Notice("Versao revisada aplicada com sucesso nos dois lados.");
+  } catch (err) {
+    console.error(err);
+    new Notice(`Falha ao aplicar a versao revisada: ${(err as Error).message}`);
+  }
+}
+
+type HunkChoice = "local" | "remote" | "both";
+
+// Janela de revisao de diferencas: mostra vermelho/verde por trecho e deixa escolher o que fica
+class MergeReviewModal extends Modal {
+  private hunks: MergeHunk[];
+  private choices: HunkChoice[];
+  private onResolve: (merged: string) => void;
+
+  constructor(app: App, localContent: string, remoteContent: string, onResolve: (merged: string) => void) {
     super(app);
-    this.message = message;
-    this.onConfirm = onConfirm;
+    const diff = diffLines(localContent.split("\n"), remoteContent.split("\n"));
+    this.hunks = groupIntoHunks(diff);
+    this.choices = this.hunks.map(() => "both");
+    this.onResolve = onResolve;
   }
 
   onOpen() {
     const { contentEl } = this;
-    contentEl.createEl("h2", { text: "Possivel conflito" });
-    contentEl.createEl("p", { text: this.message });
+    contentEl.createEl("h2", { text: "Revisar diferencas antes de continuar" });
+    contentEl.createEl("p", {
+      text: "A nota e o Google Doc mudaram desde a ultima sincronizacao. Escolha o que fica em cada trecho destacado.",
+    });
+
+    const diffContainer = contentEl.createDiv();
+    diffContainer.style.maxHeight = "50vh";
+    diffContainer.style.overflowY = "auto";
+    diffContainer.style.fontFamily = "monospace";
+    diffContainer.style.fontSize = "0.85em";
+    diffContainer.style.border = "1px solid var(--background-modifier-border)";
+    diffContainer.style.borderRadius = "6px";
+    diffContainer.style.padding = "8px";
+
+    this.hunks.forEach((hunk, index) => {
+      if (hunk.kind === "same") {
+        for (const line of hunk.lines) {
+          const lineEl = diffContainer.createDiv({ text: line.length > 0 ? line : " " });
+          lineEl.style.whiteSpace = "pre-wrap";
+          lineEl.style.opacity = "0.6";
+        }
+        return;
+      }
+
+      const hunkEl = diffContainer.createDiv();
+      hunkEl.style.margin = "6px 0";
+      hunkEl.style.border = "1px solid var(--background-modifier-border)";
+      hunkEl.style.borderRadius = "4px";
+      hunkEl.style.padding = "4px";
+
+      for (const line of hunk.localLines) {
+        const lineEl = hunkEl.createDiv({ text: `- ${line}` });
+        lineEl.style.whiteSpace = "pre-wrap";
+        lineEl.style.background = "rgba(248, 81, 73, 0.15)";
+      }
+      for (const line of hunk.remoteLines) {
+        const lineEl = hunkEl.createDiv({ text: `+ ${line}` });
+        lineEl.style.whiteSpace = "pre-wrap";
+        lineEl.style.background = "rgba(63, 185, 80, 0.15)";
+      }
+
+      const controls = hunkEl.createDiv();
+      controls.style.marginTop = "4px";
+      controls.style.display = "flex";
+      controls.style.gap = "6px";
+
+      const options: Array<{ value: HunkChoice; label: string }> = [
+        { value: "local", label: "Manter a nota" },
+        { value: "remote", label: "Manter o Doc" },
+        { value: "both", label: "Manter os dois" },
+      ];
+
+      const buttons: HTMLButtonElement[] = [];
+
+      const refreshButtons = () => {
+        buttons.forEach((btn, i) => {
+          btn.toggleClass("mod-cta", options[i].value === this.choices[index]);
+        });
+      };
+
+      options.forEach((option) => {
+        const btn = controls.createEl("button", { text: option.label });
+        btn.addEventListener("click", () => {
+          this.choices[index] = option.value;
+          refreshButtons();
+        });
+        buttons.push(btn);
+      });
+
+      refreshButtons();
+    });
 
     const buttonRow = contentEl.createDiv({ cls: "modal-button-container" });
 
     const cancelButton = buttonRow.createEl("button", { text: "Cancelar" });
     cancelButton.addEventListener("click", () => this.close());
 
-    const confirmButton = buttonRow.createEl("button", {
-      text: "Continuar mesmo assim",
-      cls: "mod-warning",
-    });
-    confirmButton.addEventListener("click", () => {
+    const applyButton = buttonRow.createEl("button", { text: "Aplicar", cls: "mod-cta" });
+    applyButton.addEventListener("click", () => {
+      const merged = this.buildMergedContent();
       this.close();
-      this.onConfirm();
+      this.onResolve(merged);
     });
+  }
+
+  private buildMergedContent(): string {
+    const lines: string[] = [];
+
+    this.hunks.forEach((hunk, index) => {
+      if (hunk.kind === "same") {
+        lines.push(...hunk.lines);
+        return;
+      }
+
+      const choice = this.choices[index];
+      if (choice === "local" || choice === "both") lines.push(...hunk.localLines);
+      if (choice === "remote" || choice === "both") lines.push(...hunk.remoteLines);
+    });
+
+    return lines.join("\n");
   }
 
   onClose() {
@@ -941,26 +1151,22 @@ export default class GoogleDocsHubPlugin extends Plugin {
         try {
           const rawContent = await this.app.vault.read(file);
           const content = rawContent.replace(FRONTMATTER_BLOCK_PATTERN, "");
-          const localHash = hashContent(content);
           const doc = await fetchGoogleDoc(this, docId);
 
-          await guardAgainstConflict(this, frontmatter, doc, localHash, "publish", async () => {
-            new Notice("Publicando nota no Google Docs...");
-            try {
-              await publishNoteToDoc(this, doc, docId, content);
+          const lastRevision = frontmatter?.[FRONTMATTER_LAST_SYNCED_REVISION_KEY];
+          const lastHash = frontmatter?.[FRONTMATTER_LAST_SYNCED_HASH_KEY];
+          const hasPriorSync = Boolean(lastRevision && lastHash);
+          const remoteChanged = hasPriorSync && doc.revisionId !== lastRevision;
 
-              const updatedDoc = await fetchGoogleDoc(this, docId);
-              await this.app.fileManager.processFrontMatter(file, (fm) => {
-                fm[FRONTMATTER_LAST_SYNCED_REVISION_KEY] = updatedDoc.revisionId;
-                fm[FRONTMATTER_LAST_SYNCED_HASH_KEY] = localHash;
-              });
+          if (remoteChanged) {
+            const remoteContent = convertDocToMarkdown(doc);
+            new MergeReviewModal(this.app, content, remoteContent, (merged) => {
+              applyMergedContent(this, file, docId, merged);
+            }).open();
+            return;
+          }
 
-              new Notice("Nota publicada com sucesso no Google Docs.");
-            } catch (err) {
-              console.error(err);
-              new Notice(`Falha ao publicar: ${(err as Error).message}`);
-            }
-          });
+          await runPublishFlow(this, file, doc, docId, content);
         } catch (err) {
           console.error(err);
           new Notice(`Falha ao publicar: ${(err as Error).message}`);
@@ -1018,28 +1224,20 @@ export default class GoogleDocsHubPlugin extends Plugin {
           const localHash = hashContent(localContent);
           const doc = await fetchGoogleDoc(this, docId);
 
-          await guardAgainstConflict(this, frontmatter, doc, localHash, "sync", async () => {
-            new Notice("Trazendo o conteudo do Google Docs para a nota...");
-            try {
-              const docText = convertDocToMarkdown(doc);
-              await this.app.vault.process(file, (data) => {
-                const frontmatterMatch = data.match(FRONTMATTER_BLOCK_PATTERN);
-                const frontmatterBlock = frontmatterMatch ? frontmatterMatch[0] : "";
-                return frontmatterBlock + docText;
-              });
+          const lastRevision = frontmatter?.[FRONTMATTER_LAST_SYNCED_REVISION_KEY];
+          const lastHash = frontmatter?.[FRONTMATTER_LAST_SYNCED_HASH_KEY];
+          const hasPriorSync = Boolean(lastRevision && lastHash);
+          const localChanged = hasPriorSync && localHash !== lastHash;
 
-              const newHash = hashContent(docText);
-              await this.app.fileManager.processFrontMatter(file, (fm) => {
-                fm[FRONTMATTER_LAST_SYNCED_REVISION_KEY] = doc.revisionId;
-                fm[FRONTMATTER_LAST_SYNCED_HASH_KEY] = newHash;
-              });
+          if (localChanged) {
+            const remoteContent = convertDocToMarkdown(doc);
+            new MergeReviewModal(this.app, localContent, remoteContent, (merged) => {
+              applyMergedContent(this, file, docId, merged);
+            }).open();
+            return;
+          }
 
-              new Notice("Nota atualizada com o conteudo do Google Docs.");
-            } catch (err) {
-              console.error(err);
-              new Notice(`Falha ao sincronizar: ${(err as Error).message}`);
-            }
-          });
+          await runSyncFlow(this, file, doc);
         } catch (err) {
           console.error(err);
           new Notice(`Falha ao sincronizar: ${(err as Error).message}`);
