@@ -42,6 +42,23 @@ interface InlineToken {
   italic?: boolean;
   code?: boolean;
   link?: string;
+  color?: string;
+}
+
+// Converte { red, green, blue } (0 a 1, formato da API do Docs) pra "#rrggbb"
+function rgbColorToHex(rgbColor: { red?: number; green?: number; blue?: number }): string {
+  const toHex = (value: number | undefined) => Math.round((value ?? 0) * 255).toString(16).padStart(2, "0");
+  return `#${toHex(rgbColor.red)}${toHex(rgbColor.green)}${toHex(rgbColor.blue)}`;
+}
+
+// Converte "#rrggbb" de volta pro formato { red, green, blue } (0 a 1) que a API do Docs espera
+function hexToRgbColor(hex: string): { red: number; green: number; blue: number } {
+  const clean = hex.replace("#", "");
+  return {
+    red: parseInt(clean.slice(0, 2), 16) / 255,
+    green: parseInt(clean.slice(2, 4), 16) / 255,
+    blue: parseInt(clean.slice(4, 6), 16) / 255,
+  };
 }
 
 type MarkdownBlock =
@@ -155,6 +172,18 @@ function parseInlineSpans(line: string): InlineToken[] {
     const rest = line.slice(i);
     let m: RegExpExecArray | null;
 
+    // <span style="color:#rrggbb">...</span>: parseia o conteudo de novo (recursivo), pra pegar
+    // negrito/italico/etc que porventura estejam dentro, e carimba a cor em cada pedaco resultante
+    if ((m = /^<span style="color:\s*(#[0-9a-fA-F]{6})">([\s\S]*?)<\/span>/.exec(rest))) {
+      const color = m[1];
+      const innerTokens = parseInlineSpans(m[2]);
+      for (const inner of innerTokens) {
+        tokens.push({ ...inner, color });
+      }
+      i += m[0].length;
+      continue;
+    }
+
     if ((m = /^`([^`]+)`/.exec(rest))) {
       tokens.push({ text: m[1], code: true });
       i += m[0].length;
@@ -185,7 +214,7 @@ function parseInlineSpans(line: string): InlineToken[] {
       continue;
     }
 
-    const nextSpecial = rest.slice(1).search(/[`\[*_]/);
+    const nextSpecial = rest.slice(1).search(/[`\[*_<]/);
     const takeLen = nextSpecial === -1 ? rest.length : nextSpecial + 1;
     tokens.push({ text: rest.slice(0, takeLen) });
     i += takeLen;
@@ -339,6 +368,10 @@ function buildDocRequestsFromMarkdown(markdown: string): { text: string; styleRe
       if (token.link) {
         fields.push("link");
         textStyle.link = { url: token.link };
+      }
+      if (token.color) {
+        fields.push("foregroundColor");
+        textStyle.foregroundColor = { color: { rgbColor: hexToRgbColor(token.color) } };
       }
 
       if (fields.length > 0 && token.text.length > 0) {
@@ -641,6 +674,11 @@ function renderParagraphMarkdown(paragraph: any): string {
 
     if (style.link?.url) {
       piece = `[${piece}](${style.link.url})`;
+    }
+
+    const rgbColor = style.foregroundColor?.color?.rgbColor;
+    if (rgbColor) {
+      piece = `<span style="color:${rgbColorToHex(rgbColor)}">${piece}</span>`;
     }
 
     markdown += piece;
@@ -1196,11 +1234,18 @@ class LinkDocModal extends Modal {
 class TabSelectionModal extends Modal {
   private tabs: Array<{ tabId: string; title: string }>;
   private onSelect: (tabId: string) => void;
+  private onBack?: () => void;
 
-  constructor(app: App, tabs: Array<{ tabId: string; title: string }>, onSelect: (tabId: string) => void) {
+  constructor(
+    app: App,
+    tabs: Array<{ tabId: string; title: string }>,
+    onSelect: (tabId: string) => void,
+    onBack?: () => void
+  ) {
     super(app);
     this.tabs = tabs;
     this.onSelect = onSelect;
+    this.onBack = onBack;
   }
 
   onOpen() {
@@ -1223,6 +1268,15 @@ class TabSelectionModal extends Modal {
         this.onSelect(tab.tabId);
       });
     }
+
+    if (this.onBack) {
+      const backButton = contentEl.createEl("button", { text: "Voltar" });
+      backButton.style.marginTop = "8px";
+      backButton.addEventListener("click", () => {
+        this.close();
+        this.onBack?.();
+      });
+    }
   }
 
   onClose() {
@@ -1230,8 +1284,54 @@ class TabSelectionModal extends Modal {
   }
 }
 
-// Logica compartilhada de Link existing Doc: extrai o docId, checa se tem varias guias (perguntando
-// qual, se tiver) e grava tudo no frontmatter. Usada tanto pelo comando quanto pelo botao na nota.
+// Janela de escolha quando o Doc tem varias guias: importar todas como notas separadas,
+// ou vincular so esta nota a uma guia especifica (que ai sim mostra a lista pra escolher)
+class TabChoiceModal extends Modal {
+  private onImportAll: () => void;
+  private onSelectOne: () => void;
+
+  constructor(app: App, onImportAll: () => void, onSelectOne: () => void) {
+    super(app);
+    this.onImportAll = onImportAll;
+    this.onSelectOne = onSelectOne;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.createEl("h2", { text: "Esse Doc tem varias guias" });
+    contentEl.createEl("p", { text: "O que voce quer fazer?" });
+
+    const importButton = contentEl.createEl("button", {
+      text: "Importar todas as guias (uma nota por guia)",
+      cls: "mod-cta",
+    });
+    importButton.style.display = "block";
+    importButton.style.width = "100%";
+    importButton.style.marginBottom = "8px";
+    importButton.addEventListener("click", () => {
+      this.close();
+      this.onImportAll();
+    });
+
+    const selectButton = contentEl.createEl("button", {
+      text: "Vincular esta nota a uma guia especifica",
+    });
+    selectButton.style.display = "block";
+    selectButton.style.width = "100%";
+    selectButton.addEventListener("click", () => {
+      this.close();
+      this.onSelectOne();
+    });
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
+// Logica compartilhada de Link existing Doc: extrai o docId, checa se tem varias guias
+// (oferecendo importar todas ou escolher uma) e grava tudo no frontmatter.
+// Usada tanto pelo comando quanto pelo botao na nota.
 async function linkNoteToDoc(plugin: GoogleDocsHubPlugin, file: TFile, url: string): Promise<void> {
   const docId = extractDocId(url);
   if (!docId) {
@@ -1261,9 +1361,35 @@ async function linkNoteToDoc(plugin: GoogleDocsHubPlugin, file: TFile, url: stri
       return;
     }
 
-    new TabSelectionModal(plugin.app, tabs, async (tabId) => {
-      await saveLink(tabId);
-    }).open();
+    // Guardada numa funcao pra dar pra "voltar" das telas seguintes sem re-colar a URL
+    const showChoice = () => {
+      new TabChoiceModal(
+        plugin.app,
+        () => {
+          const defaultFolder = sanitizeFileName(doc.title || "Google Docs Import");
+          new ImportFolderModal(
+            plugin.app,
+            defaultFolder,
+            (folderPath) => {
+              runImportAllTabs(plugin, doc, docId, url, tabs, folderPath);
+            },
+            showChoice
+          ).open();
+        },
+        () => {
+          new TabSelectionModal(
+            plugin.app,
+            tabs,
+            async (tabId) => {
+              await saveLink(tabId);
+            },
+            showChoice
+          ).open();
+        }
+      ).open();
+    };
+
+    showChoice();
   } catch (err) {
     console.error(err);
     new Notice(
@@ -1282,11 +1408,13 @@ function sanitizeFileName(name: string): string {
 class ImportFolderModal extends Modal {
   private defaultPath: string;
   private onSubmit: (folderPath: string) => void;
+  private onBack?: () => void;
 
-  constructor(app: App, defaultPath: string, onSubmit: (folderPath: string) => void) {
+  constructor(app: App, defaultPath: string, onSubmit: (folderPath: string) => void, onBack?: () => void) {
     super(app);
     this.defaultPath = defaultPath;
     this.onSubmit = onSubmit;
+    this.onBack = onBack;
   }
 
   onOpen() {
@@ -1313,6 +1441,15 @@ class ImportFolderModal extends Modal {
     });
 
     const buttonRow = contentEl.createDiv({ cls: "modal-button-container" });
+
+    if (this.onBack) {
+      const backButton = buttonRow.createEl("button", { text: "Voltar" });
+      backButton.addEventListener("click", () => {
+        this.close();
+        this.onBack?.();
+      });
+    }
+
     const button = buttonRow.createEl("button", { text: "Importar", cls: "mod-cta" });
     button.addEventListener("click", submit);
   }
