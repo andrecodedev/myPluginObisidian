@@ -1142,18 +1142,27 @@ async function syncNowCommand(plugin: GoogleDocsHubPlugin, file: TFile): Promise
 
 class LinkDocModal extends Modal {
   private onSubmit: (url: string) => void;
+  private modalTitle: string;
+  private modalDescription: string;
+  private buttonLabel: string;
 
-  constructor(app: App, onSubmit: (url: string) => void) {
+  constructor(
+    app: App,
+    onSubmit: (url: string) => void,
+    options?: { title?: string; description?: string; buttonLabel?: string }
+  ) {
     super(app);
     this.onSubmit = onSubmit;
+    this.modalTitle = options?.title ?? "Link existing Google Doc";
+    this.modalDescription =
+      options?.description ?? "Cole a URL completa do Google Doc que voce quer vincular a esta nota.";
+    this.buttonLabel = options?.buttonLabel ?? "Link";
   }
 
   onOpen() {
     const { contentEl } = this;
-    contentEl.createEl("h2", { text: "Link existing Google Doc" });
-    contentEl.createEl("p", {
-      text: "Cole a URL completa do Google Doc que voce quer vincular a esta nota.",
-    });
+    contentEl.createEl("h2", { text: this.modalTitle });
+    contentEl.createEl("p", { text: this.modalDescription });
 
     const input = contentEl.createEl("input", {
       type: "text",
@@ -1174,7 +1183,7 @@ class LinkDocModal extends Modal {
     });
 
     const buttonRow = contentEl.createDiv({ cls: "modal-button-container" });
-    const button = buttonRow.createEl("button", { text: "Link", cls: "mod-cta" });
+    const button = buttonRow.createEl("button", { text: this.buttonLabel, cls: "mod-cta" });
     button.addEventListener("click", submit);
   }
 
@@ -1261,6 +1270,137 @@ async function linkNoteToDoc(plugin: GoogleDocsHubPlugin, file: TFile, url: stri
       "Nao foi possivel checar as guias do Doc (talvez a conta ainda nao esteja conectada). Vinculando com a primeira guia por padrao."
     );
     await saveLink(undefined);
+  }
+}
+
+// Troca caracteres invalidos em nome de arquivo por espaco, pra usar o titulo da guia como nome da nota
+function sanitizeFileName(name: string): string {
+  return name.replace(/[\\/:*?"<>|]/g, " ").replace(/\s+/g, " ").trim() || "Sem titulo";
+}
+
+// Janela que pede a pasta destino antes de criar uma nota por guia
+class ImportFolderModal extends Modal {
+  private defaultPath: string;
+  private onSubmit: (folderPath: string) => void;
+
+  constructor(app: App, defaultPath: string, onSubmit: (folderPath: string) => void) {
+    super(app);
+    this.defaultPath = defaultPath;
+    this.onSubmit = onSubmit;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.createEl("h2", { text: "Importar todas as guias" });
+    contentEl.createEl("p", {
+      text: "Em qual pasta do vault as notas devem ser criadas (uma nota por guia)?",
+    });
+
+    const input = contentEl.createEl("input", { type: "text" });
+    input.value = this.defaultPath;
+    input.style.width = "100%";
+    input.focus();
+
+    const submit = () => {
+      const value = input.value.trim();
+      if (!value) return;
+      this.onSubmit(value);
+      this.close();
+    };
+
+    input.addEventListener("keydown", (evt: KeyboardEvent) => {
+      if (evt.key === "Enter") submit();
+    });
+
+    const buttonRow = contentEl.createDiv({ cls: "modal-button-container" });
+    const button = buttonRow.createEl("button", { text: "Importar", cls: "mod-cta" });
+    button.addEventListener("click", submit);
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
+// Cria uma nota por guia dentro da pasta escolhida, cada uma ja linkada e com o conteudo da sua guia
+async function runImportAllTabs(
+  plugin: GoogleDocsHubPlugin,
+  doc: any,
+  docId: string,
+  docUrl: string,
+  tabs: Array<{ tabId: string; title: string }>,
+  folderPath: string
+): Promise<void> {
+  new Notice(`Importando ${tabs.length} guias...`);
+
+  const normalizedFolder = folderPath.replace(/\/+$/, "");
+
+  try {
+    if (normalizedFolder && !plugin.app.vault.getAbstractFileByPath(normalizedFolder)) {
+      await plugin.app.vault.createFolder(normalizedFolder);
+    }
+
+    let created = 0;
+    let skipped = 0;
+
+    for (const tab of tabs) {
+      const fileName = sanitizeFileName(tab.title);
+      const path = normalizedFolder ? `${normalizedFolder}/${fileName}.md` : `${fileName}.md`;
+
+      if (plugin.app.vault.getAbstractFileByPath(path)) {
+        skipped++;
+        continue;
+      }
+
+      const content = convertDocToMarkdown(doc, tab.tabId);
+      const frontmatter = [
+        "---",
+        `${FRONTMATTER_DOC_ID_KEY}: ${docId}`,
+        `${FRONTMATTER_DOC_URL_KEY}: ${docUrl}`,
+        `${FRONTMATTER_DOC_TAB_ID_KEY}: ${tab.tabId}`,
+        "---",
+        "",
+      ].join("\n");
+
+      await plugin.app.vault.create(path, frontmatter + content);
+      created++;
+    }
+
+    const skippedMessage = skipped > 0 ? `, ${skipped} ja existiam e foram puladas` : "";
+    new Notice(`Importacao concluida: ${created} notas criadas${skippedMessage}.`);
+  } catch (err) {
+    console.error(err);
+    new Notice(`Falha ao importar as guias: ${(err as Error).message}`);
+  }
+}
+
+// Ponto de entrada do comando: pede a URL, le as guias, e abre o seletor de pasta se houver mais de uma
+async function importAllTabsAsNotes(plugin: GoogleDocsHubPlugin, url: string): Promise<void> {
+  const docId = extractDocId(url);
+  if (!docId) {
+    new Notice("URL invalida. Cole o link completo do Google Doc.");
+    return;
+  }
+
+  new Notice("Lendo as guias do Doc...");
+
+  try {
+    const doc = await fetchGoogleDoc(plugin, docId);
+    const tabs = listDocTabs(doc);
+
+    if (tabs.length <= 1) {
+      new Notice("Esse Doc so tem uma guia. Use o comando Link existing Doc numa nota normal.");
+      return;
+    }
+
+    const defaultFolder = sanitizeFileName(doc.title || "Google Docs Import");
+
+    new ImportFolderModal(plugin.app, defaultFolder, (folderPath) => {
+      runImportAllTabs(plugin, doc, docId, url, tabs, folderPath);
+    }).open();
+  } catch (err) {
+    console.error(err);
+    new Notice(`Falha ao ler as guias do Doc: ${(err as Error).message}`);
   }
 }
 
@@ -1371,6 +1511,24 @@ export default class GoogleDocsHubPlugin extends Plugin {
         new LinkDocModal(this.app, (url) => {
           linkNoteToDoc(this, file, url);
         }).open();
+      },
+    });
+
+    this.addCommand({
+      id: "import-doc-tabs",
+      name: "Import all Doc tabs as notes",
+      callback: () => {
+        new LinkDocModal(
+          this.app,
+          (url) => {
+            importAllTabsAsNotes(this, url);
+          },
+          {
+            title: "Importar todas as guias do Doc",
+            description: "Cole a URL do Google Doc que tem varias guias. Uma nota sera criada pra cada guia.",
+            buttonLabel: "Continuar",
+          }
+        ).open();
       },
     });
 
