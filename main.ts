@@ -285,14 +285,20 @@ function buildDocRequestsFromMarkdown(markdown: string): { text: string; styleRe
   const blocks = parseMarkdownBlocks(markdown);
   let text = "";
   let cursor = 1; // no Google Docs, o corpo do documento comeca no indice 1
-  const styleRequests: unknown[] = [];
+
+  // Separados em dois grupos de proposito: aplicar o estilo do PARAGRAFO (titulo, lista) depois de
+  // aplicar o estilo do TEXTO (negrito, cor, etc) faz o Google resetar a formatacao de texto direta -
+  // e o mesmo que acontece se voce clicar em "Titulo 1" DEPOIS de ja ter colorido o texto na mao.
+  // Por isso paragraphStyleRequests sempre vai ANTES de textStyleRequests no resultado final.
+  const paragraphStyleRequests: unknown[] = [];
+  const textStyleRequests: unknown[] = [];
 
   let bulletRunStart: number | null = null;
   let bulletRunOrdered = false;
 
   const flushBulletRun = (endIndex: number) => {
     if (bulletRunStart === null) return;
-    styleRequests.push({
+    paragraphStyleRequests.push({
       createParagraphBullets: {
         range: { startIndex: bulletRunStart, endIndex },
         bulletPreset: bulletRunOrdered ? "NUMBERED_DECIMAL_ALPHA_ROMAN" : "BULLET_DISC_CIRCLE_SQUARE",
@@ -320,7 +326,7 @@ function buildDocRequestsFromMarkdown(markdown: string): { text: string; styleRe
       text += block.text;
       cursor += block.text.length;
       if (block.text.length > 0) {
-        styleRequests.push({
+        textStyleRequests.push({
           updateTextStyle: {
             range: { startIndex: blockStart, endIndex: cursor },
             textStyle: { weightedFontFamily: { fontFamily: MONOSPACE_FONT_FAMILY } },
@@ -330,7 +336,7 @@ function buildDocRequestsFromMarkdown(markdown: string): { text: string; styleRe
 
         // Guarda a linguagem (ex: dataviewjs) de forma invisivel no Doc, pra o Sync now conseguir recuperar depois
         if (block.language) {
-          styleRequests.push({
+          paragraphStyleRequests.push({
             createNamedRange: {
               name: `${CODE_LANGUAGE_NAMED_RANGE_PREFIX}${block.language}`,
               range: { startIndex: blockStart, endIndex: cursor },
@@ -375,7 +381,7 @@ function buildDocRequestsFromMarkdown(markdown: string): { text: string; styleRe
       }
 
       if (fields.length > 0 && token.text.length > 0) {
-        styleRequests.push({
+        textStyleRequests.push({
           updateTextStyle: {
             range: { startIndex: spanStart, endIndex: cursor },
             textStyle,
@@ -389,7 +395,7 @@ function buildDocRequestsFromMarkdown(markdown: string): { text: string; styleRe
     cursor += 1;
 
     if (block.type === "heading") {
-      styleRequests.push({
+      paragraphStyleRequests.push({
         updateParagraphStyle: {
           range: { startIndex: paragraphStart, endIndex: cursor },
           paragraphStyle: { namedStyleType: HEADING_NAMED_STYLES[block.level - 1] },
@@ -406,7 +412,7 @@ function buildDocRequestsFromMarkdown(markdown: string): { text: string; styleRe
 
   flushBulletRun(cursor);
 
-  return { text, styleRequests };
+  return { text, styleRequests: [...paragraphStyleRequests, ...textStyleRequests] };
 }
 
 function base64UrlEncode(buffer: Buffer): string {
