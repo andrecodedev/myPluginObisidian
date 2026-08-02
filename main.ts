@@ -5,6 +5,7 @@ import { shell } from "electron";
 
 const FRONTMATTER_DOC_ID_KEY = "google_doc_id";
 const FRONTMATTER_DOC_URL_KEY = "google_doc_url";
+const FRONTMATTER_DOC_TAB_ID_KEY = "google_doc_tab_id";
 const FRONTMATTER_LAST_SYNCED_REVISION_KEY = "google_doc_last_synced_revision_id";
 const FRONTMATTER_LAST_SYNCED_HASH_KEY = "google_doc_last_synced_content_hash";
 
@@ -524,14 +525,60 @@ async function googleApiFetch(plugin: GoogleDocsHubPlugin, url: string, options:
   });
 }
 
+// includeTabsContent=true e obrigatorio pra API devolver o conteudo de TODAS as guias do Doc,
+// nao so a primeira (esse e o comportamento padrao do Google se a gente nao pedir explicitamente)
 async function fetchGoogleDoc(plugin: GoogleDocsHubPlugin, docId: string): Promise<any> {
-  const response = await googleApiFetch(plugin, `${GOOGLE_DOCS_API_URL}/${docId}`);
+  const response = await googleApiFetch(plugin, `${GOOGLE_DOCS_API_URL}/${docId}?includeTabsContent=true`);
   if (!response.ok) {
     throw new Error(
       `Nao foi possivel ler o Doc (HTTP ${response.status}). Confira se o docId esta correto e se voce tem acesso a ele.`
     );
   }
   return response.json();
+}
+
+// Achata a arvore de guias (uma guia pode ter sub-guias) numa lista simples, na ordem que aparecem
+function flattenDocTabs(tabs: any[] | undefined, out: any[] = []): any[] {
+  for (const tab of tabs ?? []) {
+    out.push(tab);
+    if (tab.childTabs?.length) flattenDocTabs(tab.childTabs, out);
+  }
+  return out;
+}
+
+// Lista so o id e o titulo de cada guia, pra mostrar num seletor
+function listDocTabs(doc: any): Array<{ tabId: string; title: string }> {
+  return flattenDocTabs(doc.tabs).map((tab) => ({
+    tabId: tab.tabProperties?.tabId,
+    title: tab.tabProperties?.title || "(sem titulo)",
+  }));
+}
+
+// Devolve o "corpo" da guia certa (ou a primeira, se a nota ainda nao tem guia salva/documento sem guias),
+// no mesmo formato { body, lists, namedRanges } que o resto do codigo ja sabe ler
+function resolveDocForTab(doc: any, tabId?: string): { body: any; lists: any; namedRanges: any } {
+  const flatTabs = flattenDocTabs(doc.tabs);
+
+  if (flatTabs.length === 0) {
+    return { body: doc.body, lists: doc.lists, namedRanges: doc.namedRanges };
+  }
+
+  const target = (tabId && flatTabs.find((tab) => tab.tabProperties?.tabId === tabId)) || flatTabs[0];
+  const documentTab = target.documentTab ?? {};
+  return { body: documentTab.body, lists: documentTab.lists, namedRanges: documentTab.namedRanges };
+}
+
+// Carimba tabId em todo range/location dos requests, senao o Google aplica na primeira guia por padrao
+function withTabId(requests: unknown[], tabId?: string): unknown[] {
+  if (!tabId) return requests;
+
+  return requests.map((request) => {
+    const clone = JSON.parse(JSON.stringify(request));
+    const inner = Object.values(clone)[0] as any;
+    if (inner?.range) inner.range.tabId = tabId;
+    if (inner?.location) inner.location.tabId = tabId;
+    return clone;
+  });
 }
 
 // Junta so o texto puro de um paragrafo, sem aplicar nenhum estilo Markdown
@@ -707,10 +754,11 @@ function reclassifyBlankLinesInsideCode(tokens: DocToken[]): void {
 }
 
 // Percorre os paragrafos do Doc e reconstroi o Markdown: titulos, listas, bloco de codigo, texto normal
-function convertDocToMarkdown(doc: any): string {
-  const tokens = tokenizeDocParagraphs(doc);
+function convertDocToMarkdown(doc: any, tabId?: string): string {
+  const resolved = resolveDocForTab(doc, tabId);
+  const tokens = tokenizeDocParagraphs(resolved);
   reclassifyBlankLinesInsideCode(tokens);
-  const languageRanges = buildCodeLanguageRanges(doc);
+  const languageRanges = buildCodeLanguageRanges(resolved);
 
   const lines: string[] = [];
   let inCodeBlock = false;
@@ -769,8 +817,15 @@ function convertDocToMarkdown(doc: any): string {
   return lines.join("\n");
 }
 
-async function publishNoteToDoc(plugin: GoogleDocsHubPlugin, doc: any, docId: string, markdown: string): Promise<void> {
-  const bodyContent = doc.body?.content ?? [];
+async function publishNoteToDoc(
+  plugin: GoogleDocsHubPlugin,
+  doc: any,
+  docId: string,
+  markdown: string,
+  tabId?: string
+): Promise<void> {
+  const { body } = resolveDocForTab(doc, tabId);
+  const bodyContent = body?.content ?? [];
   const lastElement = bodyContent[bodyContent.length - 1];
   const endIndex = lastElement?.endIndex ?? 1;
 
@@ -792,7 +847,7 @@ async function publishNoteToDoc(plugin: GoogleDocsHubPlugin, doc: any, docId: st
   const updateResponse = await googleApiFetch(plugin, `${GOOGLE_DOCS_API_URL}/${docId}:batchUpdate`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ requests }),
+    body: JSON.stringify({ requests: withTabId(requests, tabId) }),
   });
 
   if (!updateResponse.ok) {
@@ -807,11 +862,12 @@ async function runPublishFlow(
   file: TFile,
   doc: any,
   docId: string,
-  content: string
+  content: string,
+  tabId?: string
 ): Promise<void> {
   new Notice("Publicando nota no Google Docs...");
   try {
-    await publishNoteToDoc(plugin, doc, docId, content);
+    await publishNoteToDoc(plugin, doc, docId, content, tabId);
 
     const updatedDoc = await fetchGoogleDoc(plugin, docId);
     const localHash = hashContent(content);
@@ -828,10 +884,10 @@ async function runPublishFlow(
 }
 
 // Sincroniza sem nenhum conflito pendente: traz o Doc pra nota e atualiza o "carimbo" de ultima sincronizacao
-async function runSyncFlow(plugin: GoogleDocsHubPlugin, file: TFile, doc: any): Promise<void> {
+async function runSyncFlow(plugin: GoogleDocsHubPlugin, file: TFile, doc: any, tabId?: string): Promise<void> {
   new Notice("Trazendo o conteudo do Google Docs para a nota...");
   try {
-    const docText = convertDocToMarkdown(doc);
+    const docText = convertDocToMarkdown(doc, tabId);
     await plugin.app.vault.process(file, (data) => {
       const frontmatterMatch = data.match(FRONTMATTER_BLOCK_PATTERN);
       const frontmatterBlock = frontmatterMatch ? frontmatterMatch[0] : "";
@@ -856,12 +912,13 @@ async function applyMergedContent(
   plugin: GoogleDocsHubPlugin,
   file: TFile,
   docId: string,
-  mergedContent: string
+  mergedContent: string,
+  tabId?: string
 ): Promise<void> {
   new Notice("Aplicando a versao revisada na nota e no Google Docs...");
   try {
     const doc = await fetchGoogleDoc(plugin, docId);
-    await publishNoteToDoc(plugin, doc, docId, mergedContent);
+    await publishNoteToDoc(plugin, doc, docId, mergedContent, tabId);
 
     await plugin.app.vault.process(file, (data) => {
       const frontmatterMatch = data.match(FRONTMATTER_BLOCK_PATTERN);
@@ -1017,6 +1074,8 @@ async function publishNoteCommand(plugin: GoogleDocsHubPlugin, file: TFile): Pro
     return;
   }
 
+  const tabId = frontmatter?.[FRONTMATTER_DOC_TAB_ID_KEY];
+
   try {
     const rawContent = await plugin.app.vault.read(file);
     const content = rawContent.replace(FRONTMATTER_BLOCK_PATTERN, "");
@@ -1028,14 +1087,14 @@ async function publishNoteCommand(plugin: GoogleDocsHubPlugin, file: TFile): Pro
     const remoteChanged = hasPriorSync && doc.revisionId !== lastRevision;
 
     if (remoteChanged) {
-      const remoteContent = convertDocToMarkdown(doc);
+      const remoteContent = convertDocToMarkdown(doc, tabId);
       new MergeReviewModal(plugin.app, content, remoteContent, (merged) => {
-        applyMergedContent(plugin, file, docId, merged);
+        applyMergedContent(plugin, file, docId, merged, tabId);
       }).open();
       return;
     }
 
-    await runPublishFlow(plugin, file, doc, docId, content);
+    await runPublishFlow(plugin, file, doc, docId, content, tabId);
   } catch (err) {
     console.error(err);
     new Notice(`Falha ao publicar: ${(err as Error).message}`);
@@ -1051,6 +1110,8 @@ async function syncNowCommand(plugin: GoogleDocsHubPlugin, file: TFile): Promise
     return;
   }
 
+  const tabId = frontmatter?.[FRONTMATTER_DOC_TAB_ID_KEY];
+
   try {
     const rawContent = await plugin.app.vault.read(file);
     const localContent = rawContent.replace(FRONTMATTER_BLOCK_PATTERN, "");
@@ -1063,14 +1124,14 @@ async function syncNowCommand(plugin: GoogleDocsHubPlugin, file: TFile): Promise
     const localChanged = hasPriorSync && localHash !== lastHash;
 
     if (localChanged) {
-      const remoteContent = convertDocToMarkdown(doc);
+      const remoteContent = convertDocToMarkdown(doc, tabId);
       new MergeReviewModal(plugin.app, localContent, remoteContent, (merged) => {
-        applyMergedContent(plugin, file, docId, merged);
+        applyMergedContent(plugin, file, docId, merged, tabId);
       }).open();
       return;
     }
 
-    await runSyncFlow(plugin, file, doc);
+    await runSyncFlow(plugin, file, doc, tabId);
   } catch (err) {
     console.error(err);
     new Notice(`Falha ao sincronizar: ${(err as Error).message}`);
@@ -1117,6 +1178,87 @@ class LinkDocModal extends Modal {
 
   onClose() {
     this.contentEl.empty();
+  }
+}
+
+// Janela que aparece quando o Doc linkado tem mais de uma guia, pra escolher qual guia essa nota segue
+class TabSelectionModal extends Modal {
+  private tabs: Array<{ tabId: string; title: string }>;
+  private onSelect: (tabId: string) => void;
+
+  constructor(app: App, tabs: Array<{ tabId: string; title: string }>, onSelect: (tabId: string) => void) {
+    super(app);
+    this.tabs = tabs;
+    this.onSelect = onSelect;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.createEl("h2", { text: "Esse Doc tem varias guias" });
+    contentEl.createEl("p", { text: "Escolha qual guia essa nota deve sincronizar." });
+
+    const listEl = contentEl.createDiv();
+    listEl.style.maxHeight = "50vh";
+    listEl.style.overflowY = "auto";
+
+    for (const tab of this.tabs) {
+      const button = listEl.createEl("button", { text: tab.title });
+      button.style.display = "block";
+      button.style.width = "100%";
+      button.style.marginBottom = "6px";
+      button.style.textAlign = "left";
+      button.addEventListener("click", () => {
+        this.close();
+        this.onSelect(tab.tabId);
+      });
+    }
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
+// Logica compartilhada de Link existing Doc: extrai o docId, checa se tem varias guias (perguntando
+// qual, se tiver) e grava tudo no frontmatter. Usada tanto pelo comando quanto pelo botao na nota.
+async function linkNoteToDoc(plugin: GoogleDocsHubPlugin, file: TFile, url: string): Promise<void> {
+  const docId = extractDocId(url);
+  if (!docId) {
+    new Notice("URL invalida. Cole o link completo do Google Doc.");
+    return;
+  }
+
+  const saveLink = async (tabId?: string) => {
+    await plugin.app.fileManager.processFrontMatter(file, (frontmatter) => {
+      frontmatter[FRONTMATTER_DOC_ID_KEY] = docId;
+      frontmatter[FRONTMATTER_DOC_URL_KEY] = url;
+      if (tabId) {
+        frontmatter[FRONTMATTER_DOC_TAB_ID_KEY] = tabId;
+      } else {
+        delete frontmatter[FRONTMATTER_DOC_TAB_ID_KEY];
+      }
+    });
+    new Notice(`Nota vinculada ao Doc ${docId}`);
+  };
+
+  try {
+    const doc = await fetchGoogleDoc(plugin, docId);
+    const tabs = listDocTabs(doc);
+
+    if (tabs.length <= 1) {
+      await saveLink(tabs[0]?.tabId);
+      return;
+    }
+
+    new TabSelectionModal(plugin.app, tabs, async (tabId) => {
+      await saveLink(tabId);
+    }).open();
+  } catch (err) {
+    console.error(err);
+    new Notice(
+      "Nao foi possivel checar as guias do Doc (talvez a conta ainda nao esteja conectada). Vinculando com a primeira guia por padrao."
+    );
+    await saveLink(undefined);
   }
 }
 
@@ -1224,19 +1366,8 @@ export default class GoogleDocsHubPlugin extends Plugin {
           return;
         }
 
-        new LinkDocModal(this.app, async (url) => {
-          const docId = extractDocId(url);
-          if (!docId) {
-            new Notice("URL invalida. Cole o link completo do Google Doc.");
-            return;
-          }
-
-          await this.app.fileManager.processFrontMatter(file, (frontmatter) => {
-            frontmatter[FRONTMATTER_DOC_ID_KEY] = docId;
-            frontmatter[FRONTMATTER_DOC_URL_KEY] = url;
-          });
-
-          new Notice(`Nota vinculada ao Doc ${docId}`);
+        new LinkDocModal(this.app, (url) => {
+          linkNoteToDoc(this, file, url);
         }).open();
       },
     });
@@ -1301,19 +1432,8 @@ export default class GoogleDocsHubPlugin extends Plugin {
 
     if (!docId) {
       const linkAction = this.addLabeledAction(view, "link", "Link existing Doc", "#EA4335", () => {
-        new LinkDocModal(this.app, async (url) => {
-          const newDocId = extractDocId(url);
-          if (!newDocId) {
-            new Notice("URL invalida. Cole o link completo do Google Doc.");
-            return;
-          }
-
-          await this.app.fileManager.processFrontMatter(file, (frontmatter) => {
-            frontmatter[FRONTMATTER_DOC_ID_KEY] = newDocId;
-            frontmatter[FRONTMATTER_DOC_URL_KEY] = url;
-          });
-
-          new Notice(`Nota vinculada ao Doc ${newDocId}`);
+        new LinkDocModal(this.app, (url) => {
+          linkNoteToDoc(this, file, url);
         }).open();
       });
 
