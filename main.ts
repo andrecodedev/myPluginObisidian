@@ -46,11 +46,13 @@ type MarkdownBlock =
   | { type: "bullet"; tokens: InlineToken[] }
   | { type: "numbered"; tokens: InlineToken[] }
   | { type: "paragraph"; tokens: InlineToken[] }
-  | { type: "code"; text: string }
+  | { type: "code"; text: string; language?: string }
   | { type: "blank" };
 
 const HEADING_NAMED_STYLES = ["HEADING_1", "HEADING_2", "HEADING_3", "HEADING_4", "HEADING_5", "HEADING_6"];
 const MONOSPACE_FONT_FAMILY = "Courier New";
+// Prefixo do Named Range usado pra guardar, de forma invisivel no Doc, qual era a linguagem do bloco de codigo
+const CODE_LANGUAGE_NAMED_RANGE_PREFIX = "code-lang:";
 
 function extractDocId(url: string): string | null {
   const match = url.match(/\/document\/d\/([a-zA-Z0-9_-]+)/);
@@ -115,7 +117,9 @@ function parseMarkdownBlocks(markdown: string): MarkdownBlock[] {
   while (i < lines.length) {
     const line = lines[i];
 
-    if (/^```/.test(line.trim())) {
+    const fenceOpenMatch = /^```(\S*)/.exec(line.trim());
+    if (fenceOpenMatch) {
+      const language = fenceOpenMatch[1] || undefined;
       const codeLines: string[] = [];
       i++;
       while (i < lines.length && !/^```/.test(lines[i].trim())) {
@@ -123,7 +127,7 @@ function parseMarkdownBlocks(markdown: string): MarkdownBlock[] {
         i++;
       }
       i++; // pula a cerca de fechamento
-      blocks.push({ type: "code", text: codeLines.join("\n") });
+      blocks.push({ type: "code", text: codeLines.join("\n"), language });
       continue;
     }
 
@@ -208,6 +212,16 @@ function buildDocRequestsFromMarkdown(markdown: string): { text: string; styleRe
             fields: "weightedFontFamily",
           },
         });
+
+        // Guarda a linguagem (ex: dataviewjs) de forma invisivel no Doc, pra o Sync now conseguir recuperar depois
+        if (block.language) {
+          styleRequests.push({
+            createNamedRange: {
+              name: `${CODE_LANGUAGE_NAMED_RANGE_PREFIX}${block.language}`,
+              range: { startIndex: blockStart, endIndex: cursor },
+            },
+          });
+        }
       }
       text += "\n";
       cursor += 1;
@@ -510,11 +524,40 @@ function isOrderedListItem(doc: any, listId: string, nestingLevel: number): bool
 }
 
 type DocToken =
-  | { kind: "code"; text: string }
+  | { kind: "code"; text: string; startIndex?: number }
   | { kind: "empty" }
   | { kind: "bullet"; ordered: boolean; text: string }
   | { kind: "heading"; level: number; text: string }
   | { kind: "paragraph"; text: string };
+
+// Le doc.namedRanges e monta a lista de trechos marcados com "essa faixa de indices e da linguagem X"
+function buildCodeLanguageRanges(doc: any): Array<{ start: number; end: number; language: string }> {
+  const namedRanges = doc.namedRanges ?? {};
+  const ranges: Array<{ start: number; end: number; language: string }> = [];
+
+  for (const name of Object.keys(namedRanges)) {
+    if (!name.startsWith(CODE_LANGUAGE_NAMED_RANGE_PREFIX)) continue;
+    const language = name.slice(CODE_LANGUAGE_NAMED_RANGE_PREFIX.length);
+    const entries = namedRanges[name]?.namedRanges ?? [];
+    for (const entry of entries) {
+      for (const range of entry.ranges ?? []) {
+        ranges.push({ start: range.startIndex, end: range.endIndex, language });
+      }
+    }
+  }
+
+  return ranges;
+}
+
+function findCodeLanguage(
+  ranges: Array<{ start: number; end: number; language: string }>,
+  index: number
+): string | null {
+  for (const r of ranges) {
+    if (index >= r.start && index < r.end) return r.language;
+  }
+  return null;
+}
 
 // Percorre os paragrafos do Doc e classifica cada um, sem decidir ainda as linhas em branco ambiguas
 function tokenizeDocParagraphs(doc: any): DocToken[] {
@@ -535,7 +578,7 @@ function tokenizeDocParagraphs(doc: any): DocToken[] {
     }
 
     if (!bullet && namedStyle === "NORMAL_TEXT" && isWholeLineMonospace(paragraph)) {
-      tokens.push({ kind: "code", text: plainText });
+      tokens.push({ kind: "code", text: plainText, startIndex: element.startIndex });
       continue;
     }
 
@@ -582,6 +625,7 @@ function reclassifyBlankLinesInsideCode(tokens: DocToken[]): void {
 function convertDocToMarkdown(doc: any): string {
   const tokens = tokenizeDocParagraphs(doc);
   reclassifyBlankLinesInsideCode(tokens);
+  const languageRanges = buildCodeLanguageRanges(doc);
 
   const lines: string[] = [];
   let inCodeBlock = false;
@@ -597,7 +641,8 @@ function convertDocToMarkdown(doc: any): string {
   for (const token of tokens) {
     if (token.kind === "code") {
       if (!inCodeBlock) {
-        lines.push("```");
+        const language = token.startIndex !== undefined ? findCodeLanguage(languageRanges, token.startIndex) : null;
+        lines.push(language ? "```" + language : "```");
         inCodeBlock = true;
       }
       lines.push(token.text);
