@@ -435,20 +435,208 @@ async function fetchGoogleDoc(plugin: GoogleDocsHubPlugin, docId: string): Promi
   return response.json();
 }
 
-function extractPlainTextFromDoc(doc: any): string {
-  const bodyContent = doc.body?.content ?? [];
+// Junta so o texto puro de um paragrafo, sem aplicar nenhum estilo Markdown
+function getParagraphPlainText(paragraph: any): string {
+  const elements = paragraph.elements ?? [];
   let text = "";
 
-  for (const element of bodyContent) {
-    const paragraphElements = element.paragraph?.elements ?? [];
-    for (const paragraphElement of paragraphElements) {
-      if (paragraphElement.textRun?.content) {
-        text += paragraphElement.textRun.content;
-      }
-    }
+  for (const element of elements) {
+    const run = element.textRun;
+    if (!run) continue;
+    text += (run.content ?? "").replace(/\n$/, "");
   }
 
   return text;
+}
+
+// Verdadeiro se TODO o texto do paragrafo estiver em fonte monoespacada (nosso sinal de "isso e uma linha de codigo")
+function isWholeLineMonospace(paragraph: any): boolean {
+  const elements = paragraph.elements ?? [];
+  let sawContent = false;
+
+  for (const element of elements) {
+    const run = element.textRun;
+    if (!run) continue;
+    const content = (run.content ?? "").replace(/\n$/, "");
+    if (content.length === 0) continue;
+    sawContent = true;
+    if (run.textStyle?.weightedFontFamily?.fontFamily !== MONOSPACE_FONT_FAMILY) return false;
+  }
+
+  return sawContent;
+}
+
+// Reconstroi a linha em Markdown, aplicando negrito/italico/codigo-inline/link por trecho (textRun)
+function renderParagraphMarkdown(paragraph: any): string {
+  const elements = paragraph.elements ?? [];
+  let markdown = "";
+
+  for (const element of elements) {
+    const run = element.textRun;
+    if (!run) continue;
+
+    const content = (run.content ?? "").replace(/\n$/, "");
+    if (content.length === 0) continue;
+
+    const style = run.textStyle ?? {};
+    const isMonospace = style.weightedFontFamily?.fontFamily === MONOSPACE_FONT_FAMILY;
+
+    let piece = content;
+
+    if (isMonospace) {
+      piece = `\`${piece}\``;
+    } else if (style.bold && style.italic) {
+      piece = `***${piece}***`;
+    } else if (style.bold) {
+      piece = `**${piece}**`;
+    } else if (style.italic) {
+      piece = `*${piece}*`;
+    }
+
+    if (style.link?.url) {
+      piece = `[${piece}](${style.link.url})`;
+    }
+
+    markdown += piece;
+  }
+
+  return markdown;
+}
+
+// Consulta a lista global do Doc pra saber se esse item e numerado ou so com marcador
+function isOrderedListItem(doc: any, listId: string, nestingLevel: number): boolean {
+  const level = doc.lists?.[listId]?.listProperties?.nestingLevels?.[nestingLevel];
+  return Boolean(level?.glyphType);
+}
+
+type DocToken =
+  | { kind: "code"; text: string }
+  | { kind: "empty" }
+  | { kind: "bullet"; ordered: boolean; text: string }
+  | { kind: "heading"; level: number; text: string }
+  | { kind: "paragraph"; text: string };
+
+// Percorre os paragrafos do Doc e classifica cada um, sem decidir ainda as linhas em branco ambiguas
+function tokenizeDocParagraphs(doc: any): DocToken[] {
+  const bodyContent = doc.body?.content ?? [];
+  const tokens: DocToken[] = [];
+
+  for (const element of bodyContent) {
+    const paragraph = element.paragraph;
+    if (!paragraph) continue; // tabelas e outras estruturas ficam de fora por ora
+
+    const plainText = getParagraphPlainText(paragraph);
+    const namedStyle = paragraph.paragraphStyle?.namedStyleType ?? "NORMAL_TEXT";
+    const bullet = paragraph.bullet;
+
+    if (plainText.trim().length === 0 && !bullet) {
+      tokens.push({ kind: "empty" });
+      continue;
+    }
+
+    if (!bullet && namedStyle === "NORMAL_TEXT" && isWholeLineMonospace(paragraph)) {
+      tokens.push({ kind: "code", text: plainText });
+      continue;
+    }
+
+    if (bullet) {
+      const ordered = isOrderedListItem(doc, bullet.listId, bullet.nestingLevel ?? 0);
+      tokens.push({ kind: "bullet", ordered, text: renderParagraphMarkdown(paragraph) });
+      continue;
+    }
+
+    const headingLevel = HEADING_NAMED_STYLES.indexOf(namedStyle) + 1;
+    if (headingLevel > 0) {
+      tokens.push({ kind: "heading", level: headingLevel, text: renderParagraphMarkdown(paragraph) });
+      continue;
+    }
+
+    tokens.push({ kind: "paragraph", text: renderParagraphMarkdown(paragraph) });
+  }
+
+  return tokens;
+}
+
+// Uma linha em branco entre duas linhas de codigo e uma linha em branco DENTRO do bloco de codigo,
+// nao um separador de fora. So da pra saber isso olhando o que vem antes e depois dela.
+function reclassifyBlankLinesInsideCode(tokens: DocToken[]): void {
+  for (let i = 0; i < tokens.length; i++) {
+    if (tokens[i].kind !== "empty") continue;
+
+    let before = i - 1;
+    while (before >= 0 && tokens[before].kind === "empty") before--;
+
+    let after = i + 1;
+    while (after < tokens.length && tokens[after].kind === "empty") after++;
+
+    const beforeIsCode = before >= 0 && tokens[before].kind === "code";
+    const afterIsCode = after < tokens.length && tokens[after].kind === "code";
+
+    if (beforeIsCode && afterIsCode) {
+      tokens[i] = { kind: "code", text: "" };
+    }
+  }
+}
+
+// Percorre os paragrafos do Doc e reconstroi o Markdown: titulos, listas, bloco de codigo, texto normal
+function convertDocToMarkdown(doc: any): string {
+  const tokens = tokenizeDocParagraphs(doc);
+  reclassifyBlankLinesInsideCode(tokens);
+
+  const lines: string[] = [];
+  let inCodeBlock = false;
+  let orderedCounter = 0;
+
+  const closeCodeBlockIfOpen = () => {
+    if (inCodeBlock) {
+      lines.push("```");
+      inCodeBlock = false;
+    }
+  };
+
+  for (const token of tokens) {
+    if (token.kind === "code") {
+      if (!inCodeBlock) {
+        lines.push("```");
+        inCodeBlock = true;
+      }
+      lines.push(token.text);
+      orderedCounter = 0;
+      continue;
+    }
+
+    closeCodeBlockIfOpen();
+
+    if (token.kind === "empty") {
+      orderedCounter = 0;
+      lines.push("");
+      continue;
+    }
+
+    if (token.kind === "bullet") {
+      if (token.ordered) {
+        orderedCounter += 1;
+        lines.push(`${orderedCounter}. ${token.text}`);
+      } else {
+        orderedCounter = 0;
+        lines.push(`- ${token.text}`);
+      }
+      continue;
+    }
+
+    orderedCounter = 0;
+
+    if (token.kind === "heading") {
+      lines.push(`${"#".repeat(token.level)} ${token.text}`);
+      continue;
+    }
+
+    lines.push(token.text);
+  }
+
+  closeCodeBlockIfOpen();
+
+  return lines.join("\n");
 }
 
 async function publishNoteToDoc(plugin: GoogleDocsHubPlugin, docId: string, markdown: string): Promise<void> {
@@ -487,7 +675,7 @@ async function publishNoteToDoc(plugin: GoogleDocsHubPlugin, docId: string, mark
 
 async function pullDocContent(plugin: GoogleDocsHubPlugin, docId: string): Promise<string> {
   const doc = await fetchGoogleDoc(plugin, docId);
-  return extractPlainTextFromDoc(doc);
+  return convertDocToMarkdown(doc);
 }
 
 class LinkDocModal extends Modal {
