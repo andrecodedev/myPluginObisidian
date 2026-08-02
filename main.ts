@@ -5,6 +5,8 @@ import { shell } from "electron";
 
 const FRONTMATTER_DOC_ID_KEY = "google_doc_id";
 const FRONTMATTER_DOC_URL_KEY = "google_doc_url";
+const FRONTMATTER_LAST_SYNCED_REVISION_KEY = "google_doc_last_synced_revision_id";
+const FRONTMATTER_LAST_SYNCED_HASH_KEY = "google_doc_last_synced_content_hash";
 
 const GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -57,6 +59,11 @@ const CODE_LANGUAGE_NAMED_RANGE_PREFIX = "code-lang:";
 function extractDocId(url: string): string | null {
   const match = url.match(/\/document\/d\/([a-zA-Z0-9_-]+)/);
   return match ? match[1] : null;
+}
+
+// "Impressao digital" curta do conteudo, pra saber se a nota mudou desde a ultima sincronizacao
+function hashContent(content: string): string {
+  return createHash("sha256").update(content).digest("hex").slice(0, 16);
 }
 
 // Le uma linha de Markdown e quebra em pedacos com o estilo de cada um (negrito, italico, codigo, link)
@@ -684,9 +691,7 @@ function convertDocToMarkdown(doc: any): string {
   return lines.join("\n");
 }
 
-async function publishNoteToDoc(plugin: GoogleDocsHubPlugin, docId: string, markdown: string): Promise<void> {
-  const doc = await fetchGoogleDoc(plugin, docId);
-
+async function publishNoteToDoc(plugin: GoogleDocsHubPlugin, doc: any, docId: string, markdown: string): Promise<void> {
   const bodyContent = doc.body?.content ?? [];
   const lastElement = bodyContent[bodyContent.length - 1];
   const endIndex = lastElement?.endIndex ?? 1;
@@ -718,9 +723,79 @@ async function publishNoteToDoc(plugin: GoogleDocsHubPlugin, docId: string, mark
   }
 }
 
-async function pullDocContent(plugin: GoogleDocsHubPlugin, docId: string): Promise<string> {
-  const doc = await fetchGoogleDoc(plugin, docId);
-  return convertDocToMarkdown(doc);
+// Decide se Publish/Sync pode rodar direto, ou se precisa avisar sobre divergencia antes
+async function guardAgainstConflict(
+  plugin: GoogleDocsHubPlugin,
+  frontmatter: Record<string, unknown> | undefined,
+  doc: any,
+  localHash: string,
+  kind: "publish" | "sync",
+  run: () => Promise<void>
+): Promise<void> {
+  const lastRevision = frontmatter?.[FRONTMATTER_LAST_SYNCED_REVISION_KEY];
+  const lastHash = frontmatter?.[FRONTMATTER_LAST_SYNCED_HASH_KEY];
+  const hasPriorSync = Boolean(lastRevision && lastHash);
+
+  if (!hasPriorSync) {
+    await run();
+    return;
+  }
+
+  const remoteChanged = doc.revisionId !== lastRevision;
+  const localChanged = localHash !== lastHash;
+  const shouldWarn = kind === "publish" ? remoteChanged : localChanged;
+
+  if (!shouldWarn) {
+    await run();
+    return;
+  }
+
+  const message =
+    remoteChanged && localChanged
+      ? "Tanto a nota quanto o Google Doc mudaram desde a ultima sincronizacao. Continuar vai sobrescrever um dos dois lados por completo."
+      : kind === "publish"
+      ? "O Google Doc foi alterado desde a ultima sincronizacao (por voce ou outra pessoa). Publicar agora vai apagar essas mudancas."
+      : "Esta nota tem alteracoes que ainda nao foram publicadas. Sincronizar agora vai substitui-las pelo conteudo do Doc.";
+
+  new ConflictModal(plugin.app, message, () => {
+    run();
+  }).open();
+}
+
+// Janela de aviso quando o Doc e a nota divergiram desde a ultima sincronizacao (conflito)
+class ConflictModal extends Modal {
+  private message: string;
+  private onConfirm: () => void;
+
+  constructor(app: App, message: string, onConfirm: () => void) {
+    super(app);
+    this.message = message;
+    this.onConfirm = onConfirm;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.createEl("h2", { text: "Possivel conflito" });
+    contentEl.createEl("p", { text: this.message });
+
+    const buttonRow = contentEl.createDiv({ cls: "modal-button-container" });
+
+    const cancelButton = buttonRow.createEl("button", { text: "Cancelar" });
+    cancelButton.addEventListener("click", () => this.close());
+
+    const confirmButton = buttonRow.createEl("button", {
+      text: "Continuar mesmo assim",
+      cls: "mod-warning",
+    });
+    confirmButton.addEventListener("click", () => {
+      this.close();
+      this.onConfirm();
+    });
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
 }
 
 class LinkDocModal extends Modal {
@@ -856,19 +931,36 @@ export default class GoogleDocsHubPlugin extends Plugin {
           return;
         }
 
-        const docId = this.app.metadataCache.getFileCache(file)?.frontmatter?.[FRONTMATTER_DOC_ID_KEY];
+        const frontmatter = this.app.metadataCache.getFileCache(file)?.frontmatter;
+        const docId = frontmatter?.[FRONTMATTER_DOC_ID_KEY];
         if (!docId) {
           new Notice("Essa nota ainda nao esta vinculada a um Doc. Rode Link existing Doc primeiro.");
           return;
         }
 
-        new Notice("Publicando nota no Google Docs...");
-
         try {
           const rawContent = await this.app.vault.read(file);
           const content = rawContent.replace(FRONTMATTER_BLOCK_PATTERN, "");
-          await publishNoteToDoc(this, docId, content);
-          new Notice("Nota publicada com sucesso no Google Docs.");
+          const localHash = hashContent(content);
+          const doc = await fetchGoogleDoc(this, docId);
+
+          await guardAgainstConflict(this, frontmatter, doc, localHash, "publish", async () => {
+            new Notice("Publicando nota no Google Docs...");
+            try {
+              await publishNoteToDoc(this, doc, docId, content);
+
+              const updatedDoc = await fetchGoogleDoc(this, docId);
+              await this.app.fileManager.processFrontMatter(file, (fm) => {
+                fm[FRONTMATTER_LAST_SYNCED_REVISION_KEY] = updatedDoc.revisionId;
+                fm[FRONTMATTER_LAST_SYNCED_HASH_KEY] = localHash;
+              });
+
+              new Notice("Nota publicada com sucesso no Google Docs.");
+            } catch (err) {
+              console.error(err);
+              new Notice(`Falha ao publicar: ${(err as Error).message}`);
+            }
+          });
         } catch (err) {
           console.error(err);
           new Notice(`Falha ao publicar: ${(err as Error).message}`);
@@ -913,22 +1005,41 @@ export default class GoogleDocsHubPlugin extends Plugin {
           return;
         }
 
-        const docId = this.app.metadataCache.getFileCache(file)?.frontmatter?.[FRONTMATTER_DOC_ID_KEY];
+        const frontmatter = this.app.metadataCache.getFileCache(file)?.frontmatter;
+        const docId = frontmatter?.[FRONTMATTER_DOC_ID_KEY];
         if (!docId) {
           new Notice("Essa nota ainda nao esta vinculada a um Doc. Rode Link existing Doc primeiro.");
           return;
         }
 
-        new Notice("Trazendo o conteudo do Google Docs para a nota...");
-
         try {
-          const docText = await pullDocContent(this, docId);
-          await this.app.vault.process(file, (data) => {
-            const frontmatterMatch = data.match(FRONTMATTER_BLOCK_PATTERN);
-            const frontmatterBlock = frontmatterMatch ? frontmatterMatch[0] : "";
-            return frontmatterBlock + docText;
+          const rawContent = await this.app.vault.read(file);
+          const localContent = rawContent.replace(FRONTMATTER_BLOCK_PATTERN, "");
+          const localHash = hashContent(localContent);
+          const doc = await fetchGoogleDoc(this, docId);
+
+          await guardAgainstConflict(this, frontmatter, doc, localHash, "sync", async () => {
+            new Notice("Trazendo o conteudo do Google Docs para a nota...");
+            try {
+              const docText = convertDocToMarkdown(doc);
+              await this.app.vault.process(file, (data) => {
+                const frontmatterMatch = data.match(FRONTMATTER_BLOCK_PATTERN);
+                const frontmatterBlock = frontmatterMatch ? frontmatterMatch[0] : "";
+                return frontmatterBlock + docText;
+              });
+
+              const newHash = hashContent(docText);
+              await this.app.fileManager.processFrontMatter(file, (fm) => {
+                fm[FRONTMATTER_LAST_SYNCED_REVISION_KEY] = doc.revisionId;
+                fm[FRONTMATTER_LAST_SYNCED_HASH_KEY] = newHash;
+              });
+
+              new Notice("Nota atualizada com o conteudo do Google Docs.");
+            } catch (err) {
+              console.error(err);
+              new Notice(`Falha ao sincronizar: ${(err as Error).message}`);
+            }
           });
-          new Notice("Nota atualizada com o conteudo do Google Docs.");
         } catch (err) {
           console.error(err);
           new Notice(`Falha ao sincronizar: ${(err as Error).message}`);
