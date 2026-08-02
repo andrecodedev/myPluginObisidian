@@ -1282,16 +1282,17 @@ export default class GoogleDocsHubPlugin extends Plugin {
     const docId = this.app.metadataCache.getFileCache(file)?.frontmatter?.[FRONTMATTER_DOC_ID_KEY];
     if (!docId) return;
 
-    const actions: HTMLElement[] = [
-      view.addAction("upload-cloud", "Publish note (Google Docs Hub)", () => {
-        publishNoteCommand(this, file);
-      }),
-      view.addAction("download-cloud", "Sync now (Google Docs Hub)", () => {
-        syncNowCommand(this, file);
-      }),
-    ];
+    const publishAction = view.addAction("upload-cloud", "Publish note (Google Docs Hub)", () => {
+      publishNoteCommand(this, file);
+    });
+    publishAction.style.color = "#4285F4"; // azul Google, pra destacar do resto dos icones
 
-    this.docActionsByView.set(view, actions);
+    const syncAction = view.addAction("download-cloud", "Sync now (Google Docs Hub)", () => {
+      syncNowCommand(this, file);
+    });
+    syncAction.style.color = "#34A853"; // verde Google
+
+    this.docActionsByView.set(view, [publishAction, syncAction]);
   }
 
   async saveSettings() {
