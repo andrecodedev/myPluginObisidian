@@ -1374,6 +1374,21 @@ async function runImportAllTabs(
   }
 }
 
+// Abre o modal que pede a URL do Doc, usado tanto pelo comando quanto pelo icone da ribbon
+function openImportAllTabsModal(plugin: GoogleDocsHubPlugin): void {
+  new LinkDocModal(
+    plugin.app,
+    (url) => {
+      importAllTabsAsNotes(plugin, url);
+    },
+    {
+      title: "Importar todas as guias do Doc",
+      description: "Cole a URL do Google Doc que tem varias guias. Uma nota sera criada pra cada guia.",
+      buttonLabel: "Continuar",
+    }
+  ).open();
+}
+
 // Ponto de entrada do comando: pede a URL, le as guias, e abre o seletor de pasta se houver mais de uma
 async function importAllTabsAsNotes(plugin: GoogleDocsHubPlugin, url: string): Promise<void> {
   const docId = extractDocId(url);
@@ -1517,19 +1532,11 @@ export default class GoogleDocsHubPlugin extends Plugin {
     this.addCommand({
       id: "import-doc-tabs",
       name: "Import all Doc tabs as notes",
-      callback: () => {
-        new LinkDocModal(
-          this.app,
-          (url) => {
-            importAllTabsAsNotes(this, url);
-          },
-          {
-            title: "Importar todas as guias do Doc",
-            description: "Cole a URL do Google Doc que tem varias guias. Uma nota sera criada pra cada guia.",
-            buttonLabel: "Continuar",
-          }
-        ).open();
-      },
+      callback: () => openImportAllTabsModal(this),
+    });
+
+    this.addRibbonIcon("folder-input", "Import all Doc tabs as notes (Google Docs Hub)", () => {
+      openImportAllTabsModal(this);
     });
 
     this.addCommand({
