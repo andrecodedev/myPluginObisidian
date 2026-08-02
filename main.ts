@@ -1084,10 +1084,12 @@ async function publishNoteCommand(plugin: GoogleDocsHubPlugin, file: TFile): Pro
     const lastRevision = frontmatter?.[FRONTMATTER_LAST_SYNCED_REVISION_KEY];
     const lastHash = frontmatter?.[FRONTMATTER_LAST_SYNCED_HASH_KEY];
     const hasPriorSync = Boolean(lastRevision && lastHash);
-    const remoteChanged = hasPriorSync && doc.revisionId !== lastRevision;
+    // Compara o conteudo da GUIA especifica, nao o revisionId do documento inteiro - senao, editar
+    // outra guia desse mesmo Doc dispararia um aviso de conflito falso nesta nota.
+    const remoteContent = convertDocToMarkdown(doc, tabId);
+    const remoteChanged = hasPriorSync && hashContent(remoteContent) !== lastHash;
 
     if (remoteChanged) {
-      const remoteContent = convertDocToMarkdown(doc, tabId);
       new MergeReviewModal(plugin.app, content, remoteContent, (merged) => {
         applyMergedContent(plugin, file, docId, merged, tabId);
       }).open();
