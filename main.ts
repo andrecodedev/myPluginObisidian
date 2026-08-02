@@ -1266,6 +1266,24 @@ export default class GoogleDocsHubPlugin extends Plugin {
     this.app.workspace.onLayoutReady(() => this.refreshDocActions());
   }
 
+  // Cria um botao de acao com icone + texto do lado (a barra nativa do Obsidian e so-icone,
+  // aqui a gente anexa um <span> de texto manualmente porque foi pedido explicitamente)
+  private addLabeledAction(view: MarkdownView, icon: string, label: string, color: string, onClick: () => void) {
+    const el = view.addAction(icon, label, onClick);
+    el.style.color = color;
+    el.style.display = "inline-flex";
+    el.style.alignItems = "center";
+    el.style.gap = "4px";
+    el.style.width = "auto";
+    el.style.whiteSpace = "nowrap";
+
+    const textSpan = el.createSpan({ text: label });
+    textSpan.style.fontSize = "0.7em";
+    textSpan.style.color = "var(--text-muted)";
+
+    return el;
+  }
+
   private refreshDocActions() {
     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
     if (!view) return;
@@ -1280,17 +1298,36 @@ export default class GoogleDocsHubPlugin extends Plugin {
     if (!file) return;
 
     const docId = this.app.metadataCache.getFileCache(file)?.frontmatter?.[FRONTMATTER_DOC_ID_KEY];
-    if (!docId) return;
 
-    const publishAction = view.addAction("upload-cloud", "Publish note (Google Docs Hub)", () => {
+    if (!docId) {
+      const linkAction = this.addLabeledAction(view, "link", "Link existing Doc", "#EA4335", () => {
+        new LinkDocModal(this.app, async (url) => {
+          const newDocId = extractDocId(url);
+          if (!newDocId) {
+            new Notice("URL invalida. Cole o link completo do Google Doc.");
+            return;
+          }
+
+          await this.app.fileManager.processFrontMatter(file, (frontmatter) => {
+            frontmatter[FRONTMATTER_DOC_ID_KEY] = newDocId;
+            frontmatter[FRONTMATTER_DOC_URL_KEY] = url;
+          });
+
+          new Notice(`Nota vinculada ao Doc ${newDocId}`);
+        }).open();
+      });
+
+      this.docActionsByView.set(view, [linkAction]);
+      return;
+    }
+
+    const publishAction = this.addLabeledAction(view, "upload-cloud", "Publish note", "#4285F4", () => {
       publishNoteCommand(this, file);
     });
-    publishAction.style.color = "#4285F4"; // azul Google, pra destacar do resto dos icones
 
-    const syncAction = view.addAction("download-cloud", "Sync now (Google Docs Hub)", () => {
+    const syncAction = this.addLabeledAction(view, "download-cloud", "Sync now", "#34A853", () => {
       syncNowCommand(this, file);
     });
-    syncAction.style.color = "#34A853"; // verde Google
 
     this.docActionsByView.set(view, [publishAction, syncAction]);
   }
