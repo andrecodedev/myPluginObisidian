@@ -43,6 +43,40 @@ interface InlineToken {
   code?: boolean;
   link?: string;
   color?: string;
+  fontFamily?: string;
+  fontSizePt?: number;
+}
+
+// Parseia o atributo style="" de um <span> (color, font-family, font-size)
+function parseCssStyleAttr(style: string): { color?: string; fontFamily?: string; fontSizePt?: number } {
+  const result: { color?: string; fontFamily?: string; fontSizePt?: number } = {};
+  for (const part of style.split(";")) {
+    const colon = part.indexOf(":");
+    if (colon === -1) continue;
+    const key = part.slice(0, colon).trim().toLowerCase();
+    const val = part.slice(colon + 1).trim();
+    if (key === "color" && /^#[0-9a-fA-F]{6}$/i.test(val)) {
+      result.color = val.toLowerCase();
+    } else if (key === "font-family" && val) {
+      result.fontFamily = val.replace(/^["']|["']$/g, "").trim();
+    } else if (key === "font-size") {
+      const pt = /^(\d+(?:\.\d+)?)pt$/i.exec(val);
+      if (pt) result.fontSizePt = parseFloat(pt[1]);
+    }
+  }
+  return result;
+}
+
+function wrapWithStyleSpan(
+  piece: string,
+  opts: { color?: string; fontFamily?: string; fontSizePt?: number }
+): string {
+  const styles: string[] = [];
+  if (opts.fontFamily) styles.push(`font-family:${opts.fontFamily}`);
+  if (opts.fontSizePt != null) styles.push(`font-size:${opts.fontSizePt}pt`);
+  if (opts.color) styles.push(`color:${opts.color}`);
+  if (styles.length === 0) return piece;
+  return `<span style="${styles.join(";")}">${piece}</span>`;
 }
 
 // Converte { red, green, blue } (0 a 1, formato da API do Docs) pra "#rrggbb"
@@ -61,18 +95,108 @@ function hexToRgbColor(hex: string): { red: number; green: number; blue: number 
   };
 }
 
+interface ParagraphSpacing {
+  spaceAbovePt?: number;
+  spaceBelowPt?: number;
+  lineSpacing?: number; // 100 = simples, 115 = 1,15 (padrao do Docs)
+}
+
+interface TableCellData {
+  text: string;
+  backgroundColor?: string; // "#rrggbb" do tableCellStyle do Docs
+  monospace?: boolean; // caixa de codigo 1x1
+}
+
 type MarkdownBlock =
-  | { type: "heading"; level: number; tokens: InlineToken[] }
-  | { type: "bullet"; tokens: InlineToken[] }
-  | { type: "numbered"; tokens: InlineToken[] }
-  | { type: "paragraph"; tokens: InlineToken[] }
+  | { type: "heading"; level: number; tokens: InlineToken[]; spacing?: ParagraphSpacing }
+  | { type: "bullet"; tokens: InlineToken[]; spacing?: ParagraphSpacing }
+  | { type: "numbered"; tokens: InlineToken[]; spacing?: ParagraphSpacing }
+  | { type: "paragraph"; tokens: InlineToken[]; spacing?: ParagraphSpacing }
   | { type: "code"; text: string; language?: string }
+  | { type: "table"; rows: TableCellData[][] } // HTML/GFM com cor de fundo por celula
+  | { type: "callout"; title: string; body: string } // caixa 1x1 tipo "Por que IO?" / dica
+  | { type: "hr" } // --- sob o titulo → borderBottom no Google Docs
   | { type: "blank" };
 
 const HEADING_NAMED_STYLES = ["HEADING_1", "HEADING_2", "HEADING_3", "HEADING_4", "HEADING_5", "HEADING_6"];
 const MONOSPACE_FONT_FAMILY = "Courier New";
 // Prefixo do Named Range usado pra guardar, de forma invisivel no Doc, qual era a linguagem do bloco de codigo
 const CODE_LANGUAGE_NAMED_RANGE_PREFIX = "code-lang:";
+// Espacamento tipico do Google Docs com "Adicionar espaco apos item de lista".
+// createParagraphBullets zera spaceBelow se vier depois — por isso o Publish aplica
+// espacamento num lote SEPARADO, depois das bullets. Minimo 18pt pra nao ficar "grudado".
+const DEFAULT_LIST_SPACING: ParagraphSpacing = { spaceBelowPt: 18, lineSpacing: 115 };
+const MIN_LIST_SPACE_BELOW_PT = 18;
+const GDOCS_SPACING_COMMENT_RE = /<!--\s*gdocs-spacing\s+([^>]*)-->\s*$/;
+
+function parseSpacingComment(line: string): { line: string; spacing?: ParagraphSpacing } {
+  const match = GDOCS_SPACING_COMMENT_RE.exec(line);
+  if (!match) return { line };
+  const spacing: ParagraphSpacing = {};
+  const sa = /\bsa="([\d.]+)"/.exec(match[1]);
+  const sb = /\bsb="([\d.]+)"/.exec(match[1]);
+  const ls = /\bls="([\d.]+)"/.exec(match[1]);
+  if (sa) spacing.spaceAbovePt = parseFloat(sa[1]);
+  if (sb) spacing.spaceBelowPt = parseFloat(sb[1]);
+  if (ls) spacing.lineSpacing = parseFloat(ls[1]);
+  return { line: line.replace(GDOCS_SPACING_COMMENT_RE, "").trimEnd(), spacing };
+}
+
+function formatSpacingComment(spacing: ParagraphSpacing): string {
+  const parts: string[] = [];
+  if (spacing.spaceAbovePt != null) parts.push(`sa="${spacing.spaceAbovePt}"`);
+  if (spacing.spaceBelowPt != null) parts.push(`sb="${spacing.spaceBelowPt}"`);
+  if (spacing.lineSpacing != null) parts.push(`ls="${spacing.lineSpacing}"`);
+  return parts.length > 0 ? ` <!--gdocs-spacing ${parts.join(" ")}-->` : "";
+}
+
+function readParagraphSpacing(paragraph: any): ParagraphSpacing {
+  const ps = paragraph.paragraphStyle ?? {};
+  const spacing: ParagraphSpacing = {};
+  if (ps.spaceAbove?.magnitude != null) spacing.spaceAbovePt = ps.spaceAbove.magnitude;
+  if (ps.spaceBelow?.magnitude != null) spacing.spaceBelowPt = ps.spaceBelow.magnitude;
+  if (ps.lineSpacing != null) spacing.lineSpacing = ps.lineSpacing;
+  return spacing;
+}
+
+// So exporta no Markdown o que importa pra fidelidade (ignora sb=0 pra nao "travar" lista grudada)
+function spacingForMarkdownExport(spacing: ParagraphSpacing): ParagraphSpacing | null {
+  const out: ParagraphSpacing = {};
+  if (spacing.spaceAbovePt != null && spacing.spaceAbovePt > 0) out.spaceAbovePt = spacing.spaceAbovePt;
+  if (spacing.spaceBelowPt != null && spacing.spaceBelowPt > 0) out.spaceBelowPt = spacing.spaceBelowPt;
+  if (spacing.lineSpacing != null) out.lineSpacing = spacing.lineSpacing;
+  return out.spaceAbovePt != null || out.spaceBelowPt != null || out.lineSpacing != null ? out : null;
+}
+
+function pushParagraphSpacingRequest(
+  paragraphStyleRequests: unknown[],
+  startIndex: number,
+  endIndex: number,
+  spacing: ParagraphSpacing
+): void {
+  const paragraphStyle: Record<string, unknown> = {};
+  const fields: string[] = [];
+  if (spacing.spaceAbovePt != null) {
+    paragraphStyle.spaceAbove = { magnitude: spacing.spaceAbovePt, unit: "PT" };
+    fields.push("spaceAbove");
+  }
+  if (spacing.spaceBelowPt != null) {
+    paragraphStyle.spaceBelow = { magnitude: spacing.spaceBelowPt, unit: "PT" };
+    fields.push("spaceBelow");
+  }
+  if (spacing.lineSpacing != null) {
+    paragraphStyle.lineSpacing = spacing.lineSpacing;
+    fields.push("lineSpacing");
+  }
+  if (fields.length === 0) return;
+  paragraphStyleRequests.push({
+    updateParagraphStyle: {
+      range: { startIndex, endIndex },
+      paragraphStyle,
+      fields: fields.join(","),
+    },
+  });
+}
 
 function extractDocId(url: string): string | null {
   const match = url.match(/\/document\/d\/([a-zA-Z0-9_-]+)/);
@@ -172,13 +296,17 @@ function parseInlineSpans(line: string): InlineToken[] {
     const rest = line.slice(i);
     let m: RegExpExecArray | null;
 
-    // <span style="color:#rrggbb">...</span>: parseia o conteudo de novo (recursivo), pra pegar
-    // negrito/italico/etc que porventura estejam dentro, e carimba a cor em cada pedaco resultante
-    if ((m = /^<span style="color:\s*(#[0-9a-fA-F]{6})">([\s\S]*?)<\/span>/.exec(rest))) {
-      const color = m[1];
+    // <span style="...">...</span>: color, font-family, font-size (pt)
+    if ((m = /^<span style="([^"]*)">([\s\S]*?)<\/span>/.exec(rest))) {
+      const css = parseCssStyleAttr(m[1]);
       const innerTokens = parseInlineSpans(m[2]);
       for (const inner of innerTokens) {
-        tokens.push({ ...inner, color });
+        tokens.push({
+          ...inner,
+          color: css.color ?? inner.color,
+          fontFamily: css.fontFamily ?? inner.fontFamily,
+          fontSizePt: css.fontSizePt ?? inner.fontSizePt,
+        });
       }
       i += m[0].length;
       continue;
@@ -223,6 +351,209 @@ function parseInlineSpans(line: string): InlineToken[] {
   return tokens;
 }
 
+// Detecta numeracao manual no texto ("1. item" ou "<span...>1. item</span>") e remove o prefixo.
+// Necessario porque Sync corrompido / TOC colado vira "- 1. item", e o Publish sem isso gera "• 1. item".
+function stripLeadingManualNumber(content: string): { ordered: boolean; content: string } {
+  const spanWrap = /^<span style="([^"]*)">([\s\S]*?)<\/span>\s*$/.exec(content);
+  if (spanWrap) {
+    const numbered = /^(\d+)\.\s+([\s\S]*)$/.exec(spanWrap[2]);
+    if (numbered) {
+      return { ordered: true, content: `<span style="${spanWrap[1]}">${numbered[2]}</span>` };
+    }
+    return { ordered: false, content };
+  }
+
+  const plain = /^(\d+)\.\s+(.*)$/.exec(content);
+  if (plain) {
+    return { ordered: true, content: plain[2] };
+  }
+
+  return { ordered: false, content };
+}
+
+function isMarkdownTableSeparator(line: string): boolean {
+  const t = line.trim();
+  return /^\|?[\s\-:|]+\|?$/.test(t) && t.includes("-");
+}
+
+function splitMarkdownTableRow(line: string): string[] {
+  let t = line.trim();
+  if (t.startsWith("|")) t = t.slice(1);
+  if (t.endsWith("|")) t = t.slice(0, -1);
+  return t.split("|").map((cell) => cell.trim().replace(/<br\s*\/?>/gi, "\n"));
+}
+
+function parseMarkdownTableLines(lines: string[]): TableCellData[][] {
+  const rows: TableCellData[][] = [];
+  for (const line of lines) {
+    if (isMarkdownTableSeparator(line)) continue;
+    const cells = splitMarkdownTableRow(line).map((text) => ({ text }));
+    if (cells.length > 0) rows.push(cells);
+  }
+  return rows;
+}
+
+function parseHtmlTable(html: string): TableCellData[][] | null {
+  const rows: TableCellData[][] = [];
+  const rowRe = /<tr\b[^>]*>([\s\S]*?)<\/tr>/gi;
+  let rowMatch: RegExpExecArray | null;
+  while ((rowMatch = rowRe.exec(html))) {
+    const cells: TableCellData[] = [];
+    const cellRe = /<t[hd]\b([^>]*)>([\s\S]*?)<\/t[hd]>/gi;
+    let cellMatch: RegExpExecArray | null;
+    while ((cellMatch = cellRe.exec(rowMatch[1]))) {
+      const attrs = cellMatch[1] ?? "";
+      const styleAttr = /style="([^"]*)"/i.exec(attrs)?.[1] ?? "";
+      const bg = /background-color:\s*(#[0-9a-fA-F]{6})/i.exec(styleAttr)?.[1]?.toLowerCase();
+      const text = cellMatch[2].replace(/<br\s*\/?>/gi, "\n").trim();
+      cells.push({ text, backgroundColor: bg });
+    }
+    if (cells.length > 0) rows.push(cells);
+  }
+  return rows.length > 0 ? rows : null;
+}
+
+function cellMarkdownToInlineTokens(cellMd: string): InlineToken[] {
+  const normalized = cellMd.replace(/<br\s*\/?>/gi, "\n");
+  const lines = normalized.split("\n");
+  const tokens: InlineToken[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    tokens.push(...parseInlineSpans(lines[i]));
+    if (i < lines.length - 1) tokens.push({ text: "\n" });
+  }
+  return tokens;
+}
+
+function inlineTokensToPlain(tokens: InlineToken[]): string {
+  return tokens.map((t) => t.text).join("");
+}
+
+function buildTextStyleRequestsForTokens(
+  tokens: InlineToken[],
+  startIndex: number,
+  forceMonospace = false
+): unknown[] {
+  const requests: unknown[] = [];
+  let cursor = startIndex;
+  for (const token of tokens) {
+    const spanStart = cursor;
+    cursor += token.text.length;
+    if (token.text.length === 0 || token.text === "\n") continue;
+
+    const fields: string[] = [];
+    const textStyle: Record<string, unknown> = {};
+
+    if (token.bold) {
+      fields.push("bold");
+      textStyle.bold = true;
+    }
+    if (token.italic) {
+      fields.push("italic");
+      textStyle.italic = true;
+    }
+    if (forceMonospace || token.code) {
+      fields.push("weightedFontFamily");
+      textStyle.weightedFontFamily = { fontFamily: MONOSPACE_FONT_FAMILY };
+    } else if (token.fontFamily) {
+      fields.push("weightedFontFamily");
+      textStyle.weightedFontFamily = { fontFamily: token.fontFamily };
+    }
+    if (token.fontSizePt != null) {
+      fields.push("fontSize");
+      textStyle.fontSize = { magnitude: token.fontSizePt, unit: "PT" };
+    }
+    if (token.link) {
+      fields.push("link");
+      textStyle.link = { url: token.link };
+    }
+    if (token.color) {
+      fields.push("foregroundColor");
+      textStyle.foregroundColor = { color: { rgbColor: hexToRgbColor(token.color) } };
+    }
+
+    if (fields.length > 0) {
+      requests.push({
+        updateTextStyle: {
+          range: { startIndex: spanStart, endIndex: cursor },
+          textStyle,
+          fields: fields.join(","),
+        },
+      });
+    }
+  }
+  return requests;
+}
+
+// GFM simples (sem cor). Preferido quando o Doc nao pinta celulas.
+function formatGfmTable(rows: TableCellData[][]): string {
+  if (rows.length === 0) return "";
+  const colCount = Math.max(...rows.map((r) => r.length), 1);
+  const normalize = (row: TableCellData[]) => {
+    const cells = row.map((c) => c.text.replace(/\n/g, "<br>").replace(/\|/g, "\\|"));
+    while (cells.length < colCount) cells.push("");
+    return `| ${cells.join(" | ")} |`;
+  };
+  const lines = [normalize(rows[0]), `| ${Array(colCount).fill("---").join(" | ")} |`];
+  for (const row of rows.slice(1)) lines.push(normalize(row));
+  return lines.join("\n");
+}
+
+function formatTableMarkdown(rows: TableCellData[][]): string {
+  const hasColors = rows.some((r) => r.some((c) => Boolean(c.backgroundColor)));
+  return hasColors ? formatHtmlTable(rows) : formatGfmTable(rows);
+}
+
+// HTML com background das celulas — Markdown GFM nao aguenta cor de cabecalho/dica do Docs
+function formatHtmlTable(rows: TableCellData[][]): string {
+  if (rows.length === 0) return "";
+  const colCount = Math.max(...rows.map((r) => r.length), 1);
+  const normalized = rows.map((r) => {
+    const padded = [...r];
+    while (padded.length < colCount) padded.push({ text: "" });
+    return padded;
+  });
+
+  // Primeira linha com fundo = cabecalho (ex.: rosa #e3115e + texto branco no Doc)
+  const firstRowIsHeader = normalized[0].some((c) => Boolean(c.backgroundColor));
+
+  const renderCell = (cell: TableCellData, tag: "th" | "td") => {
+    const styles: string[] = [];
+    if (cell.backgroundColor) styles.push(`background-color:${cell.backgroundColor}`);
+    if (tag === "th") {
+      styles.push("color:#ffffff", "font-weight:bold");
+    }
+    const styleAttr = styles.length > 0 ? ` style="${styles.join(";")}"` : "";
+    // Celulas ja vem com spans markdown/HTML do Docs; so troca \n por <br>
+    const content = cell.text.replace(/\n/g, "<br>");
+    return `<${tag}${styleAttr}>${content}</${tag}>`;
+  };
+
+  const lines: string[] = ["<table>"];
+  if (firstRowIsHeader) {
+    lines.push("<thead>");
+    lines.push(`<tr>${normalized[0].map((c) => renderCell(c, "th")).join("")}</tr>`);
+    lines.push("</thead>");
+    lines.push("<tbody>");
+    for (const row of normalized.slice(1)) {
+      lines.push(`<tr>${row.map((c) => renderCell(c, "td")).join("")}</tr>`);
+    }
+    lines.push("</tbody>");
+  } else {
+    lines.push("<tbody>");
+    for (const row of normalized) {
+      lines.push(`<tr>${row.map((c) => renderCell(c, "td")).join("")}</tr>`);
+    }
+    lines.push("</tbody>");
+  }
+  lines.push("</table>");
+  return lines.join("\n");
+}
+
+function formatCalloutMarkdown(title: string, body: string): string {
+  const bodyLines = body.split("\n").map((l) => `> ${l}`);
+  return [`> [!tip] ${title}`, ...bodyLines].join("\n");
+}
+
 // Quebra o Markdown inteiro em blocos: titulo, lista, paragrafo, bloco de codigo, linha em branco
 function parseMarkdownBlocks(markdown: string): MarkdownBlock[] {
   const lines = markdown.split("\n");
@@ -230,7 +561,8 @@ function parseMarkdownBlocks(markdown: string): MarkdownBlock[] {
   let i = 0;
 
   while (i < lines.length) {
-    const line = lines[i];
+    const rawLine = lines[i];
+    const { line, spacing } = parseSpacingComment(rawLine);
 
     const fenceOpenMatch = /^```(\S*)/.exec(line.trim());
     if (fenceOpenMatch) {
@@ -248,21 +580,86 @@ function parseMarkdownBlocks(markdown: string): MarkdownBlock[] {
 
     const headingMatch = /^(#{1,6})\s+(.*)$/.exec(line);
     if (headingMatch) {
-      blocks.push({ type: "heading", level: headingMatch[1].length, tokens: parseInlineSpans(headingMatch[2]) });
+      blocks.push({
+        type: "heading",
+        level: headingMatch[1].length,
+        tokens: parseInlineSpans(headingMatch[2]),
+        spacing,
+      });
       i++;
+      continue;
+    }
+
+    // Linha horizontal markdown → no Doc vira borderBottom do titulo anterior (a "linha embaixo do Sumario")
+    if (/^(-{3,}|\*{3,}|_{3,})$/.test(line.trim())) {
+      blocks.push({ type: "hr" });
+      i++;
+      continue;
+    }
+
+    // Callout Obsidian: > [!tip] titulo
+    const calloutMatch = /^>\s*\[!(\w+)\]\s*(.*)$/.exec(line.trim());
+    if (calloutMatch) {
+      const title = calloutMatch[2].trim();
+      const bodyLines: string[] = [];
+      i++;
+      while (i < lines.length) {
+        const next = lines[i];
+        if (!/^>/.test(next)) break;
+        bodyLines.push(next.replace(/^>\s?/, ""));
+        i++;
+      }
+      blocks.push({ type: "callout", title: title || calloutMatch[1], body: bodyLines.join("\n") });
+      continue;
+    }
+
+    // Tabela HTML (com cores de celula do Docs)
+    if (/<table\b/i.test(line)) {
+      let html = "";
+      while (i < lines.length) {
+        html += lines[i] + "\n";
+        i++;
+        if (/<\/table>/i.test(html)) break;
+      }
+      const rows = parseHtmlTable(html);
+      if (rows) blocks.push({ type: "table", rows });
+      continue;
+    }
+
+    // Tabela GFM: | col | col |
+    if (/^\|/.test(line.trim())) {
+      const tableLines: string[] = [];
+      while (i < lines.length) {
+        const { line: tableLine } = parseSpacingComment(lines[i]);
+        if (!/^\|/.test(tableLine.trim())) break;
+        tableLines.push(tableLine);
+        i++;
+      }
+      const rows = parseMarkdownTableLines(tableLines);
+      if (rows.length > 0) {
+        blocks.push({ type: "table", rows });
+      }
       continue;
     }
 
     const bulletMatch = /^[-*]\s+(.*)$/.exec(line);
     if (bulletMatch) {
-      blocks.push({ type: "bullet", tokens: parseInlineSpans(bulletMatch[1]) });
+      // "- 1. item" / "* 1. item" → lista numerada de verdade, sem o "1." no texto
+      const stripped = stripLeadingManualNumber(bulletMatch[1]);
+      blocks.push({
+        type: stripped.ordered ? "numbered" : "bullet",
+        tokens: parseInlineSpans(stripped.content),
+        spacing,
+      });
       i++;
       continue;
     }
 
     const numberedMatch = /^\d+\.\s+(.*)$/.exec(line);
     if (numberedMatch) {
-      blocks.push({ type: "numbered", tokens: parseInlineSpans(numberedMatch[1]) });
+      // Se o texto ainda trouxer "1. " por corrupcao anterior, remove de novo
+      const stripped = stripLeadingManualNumber(numberedMatch[1]);
+      blocks.push({ type: "numbered", tokens: parseInlineSpans(stripped.content), spacing });
       i++;
       continue;
     }
@@ -273,46 +670,81 @@ function parseMarkdownBlocks(markdown: string): MarkdownBlock[] {
       continue;
     }
 
-    blocks.push({ type: "paragraph", tokens: parseInlineSpans(line) });
+    blocks.push({ type: "paragraph", tokens: parseInlineSpans(line), spacing });
     i++;
   }
 
   return blocks;
 }
 
-// Converte os blocos em: (1) o texto puro a inserir e (2) os comandos de formatacao com seus indices exatos
-function buildDocRequestsFromMarkdown(markdown: string): { text: string; styleRequests: unknown[] } {
-  const blocks = parseMarkdownBlocks(markdown);
+// Converte blocos (sem tabelas) em texto + 3 grupos de requests.
+// Tabelas sao publicadas a parte em publishNoteToDoc (insertTable + fill).
+function buildDocRequestsFromBlocks(
+  blocks: MarkdownBlock[],
+  startCursor = 1
+): {
+  text: string;
+  paragraphStyleRequests: unknown[];
+  spacingRequests: unknown[];
+  textStyleRequests: unknown[];
+} {
   let text = "";
-  let cursor = 1; // no Google Docs, o corpo do documento comeca no indice 1
+  let cursor = startCursor;
 
-  // Separados em dois grupos de proposito: aplicar o estilo do PARAGRAFO (titulo, lista) depois de
-  // aplicar o estilo do TEXTO (negrito, cor, etc) faz o Google resetar a formatacao de texto direta -
-  // e o mesmo que acontece se voce clicar em "Titulo 1" DEPOIS de ja ter colorido o texto na mao.
-  // Por isso paragraphStyleRequests sempre vai ANTES de textStyleRequests no resultado final.
   const paragraphStyleRequests: unknown[] = [];
+  const spacingRequests: unknown[] = [];
   const textStyleRequests: unknown[] = [];
 
   let bulletRunStart: number | null = null;
   let bulletRunOrdered = false;
+  let lastHeading: { start: number; end: number; color: string | null } | null = null;
 
   const flushBulletRun = (endIndex: number) => {
     if (bulletRunStart === null) return;
-    paragraphStyleRequests.push({
-      createParagraphBullets: {
-        range: { startIndex: bulletRunStart, endIndex },
-        bulletPreset: bulletRunOrdered ? "NUMBERED_DECIMAL_ALPHA_ROMAN" : "BULLET_DISC_CIRCLE_SQUARE",
-      },
-    });
+    // endIndex precisa cair no fim do ultimo item (depois do "\n" dele). Se passar para o
+    // paragrafo vazio seguinte, o Google cria bullets vazios no fim da lista.
+    if (endIndex > bulletRunStart) {
+      paragraphStyleRequests.push({
+        createParagraphBullets: {
+          range: { startIndex: bulletRunStart, endIndex },
+          bulletPreset: bulletRunOrdered ? "NUMBERED_DECIMAL_ALPHA_ROMAN" : "BULLET_DISC_CIRCLE_SQUARE",
+        },
+      });
+    }
     bulletRunStart = null;
   };
 
   for (const block of blocks) {
+    // table/callout: insertTable em publishNoteToDoc (API exige re-get entre tabelas)
+    if (block.type === "table" || block.type === "callout") continue;
+
     const isListItem = block.type === "bullet" || block.type === "numbered";
     const isOrdered = block.type === "numbered";
 
     if (bulletRunStart !== null && (!isListItem || isOrdered !== bulletRunOrdered)) {
       flushBulletRun(cursor);
+    }
+
+    if (block.type === "hr") {
+      // Nao insere "---" como texto: aplica a linha embaixo do titulo anterior
+      if (lastHeading) {
+        const lineColor = lastHeading.color ?? "#000000";
+        paragraphStyleRequests.push({
+          updateParagraphStyle: {
+            range: { startIndex: lastHeading.start, endIndex: lastHeading.end },
+            paragraphStyle: {
+              borderBottom: {
+                width: { magnitude: 1, unit: "PT" },
+                padding: { magnitude: 3, unit: "PT" },
+                dashStyle: "SOLID",
+                color: { color: { rgbColor: hexToRgbColor(lineColor) } },
+              },
+            },
+            fields: "borderBottom",
+          },
+        });
+      }
+      continue;
     }
 
     if (block.type === "blank") {
@@ -370,6 +802,13 @@ function buildDocRequestsFromMarkdown(markdown: string): { text: string; styleRe
       if (token.code) {
         fields.push("weightedFontFamily");
         textStyle.weightedFontFamily = { fontFamily: MONOSPACE_FONT_FAMILY };
+      } else if (token.fontFamily) {
+        fields.push("weightedFontFamily");
+        textStyle.weightedFontFamily = { fontFamily: token.fontFamily };
+      }
+      if (token.fontSizePt != null) {
+        fields.push("fontSize");
+        textStyle.fontSize = { magnitude: token.fontSizePt, unit: "PT" };
       }
       if (token.link) {
         fields.push("link");
@@ -402,7 +841,27 @@ function buildDocRequestsFromMarkdown(markdown: string): { text: string; styleRe
           fields: "namedStyleType",
         },
       });
+      lastHeading = {
+        start: paragraphStart,
+        end: cursor,
+        color: block.tokens.find((t) => t.color)?.color ?? null,
+      };
     }
+
+    // Espacamento vai pra lista SEPARADA: createParagraphBullets no final de
+    // paragraphStyleRequests apaga spaceBelow se o espacamento vier antes dele.
+    const blockSpacing = "spacing" in block ? block.spacing : undefined;
+    const spacing: ParagraphSpacing = isListItem
+      ? {
+          spaceAbovePt: blockSpacing?.spaceAbovePt,
+          spaceBelowPt: Math.max(
+            blockSpacing?.spaceBelowPt ?? MIN_LIST_SPACE_BELOW_PT,
+            MIN_LIST_SPACE_BELOW_PT
+          ),
+          lineSpacing: blockSpacing?.lineSpacing ?? DEFAULT_LIST_SPACING.lineSpacing,
+        }
+      : { ...blockSpacing };
+    pushParagraphSpacingRequest(spacingRequests, paragraphStart, cursor, spacing);
 
     if (isListItem && bulletRunStart === null) {
       bulletRunStart = paragraphStart;
@@ -412,7 +871,16 @@ function buildDocRequestsFromMarkdown(markdown: string): { text: string; styleRe
 
   flushBulletRun(cursor);
 
-  return { text, styleRequests: [...paragraphStyleRequests, ...textStyleRequests] };
+  return { text, paragraphStyleRequests, spacingRequests, textStyleRequests };
+}
+
+function buildDocRequestsFromMarkdown(markdown: string): {
+  text: string;
+  paragraphStyleRequests: unknown[];
+  spacingRequests: unknown[];
+  textStyleRequests: unknown[];
+} {
+  return buildDocRequestsFromBlocks(parseMarkdownBlocks(markdown), 1);
 }
 
 function base64UrlEncode(buffer: Buffer): string {
@@ -607,15 +1075,36 @@ function resolveDocForTab(doc: any, tabId?: string): { body: any; lists: any; na
   return { body: documentTab.body, lists: documentTab.lists, namedRanges: documentTab.namedRanges };
 }
 
-// Carimba tabId em todo range/location dos requests, senao o Google aplica na primeira guia por padrao
+// Carimba tabId em todo range/location dos requests, senao o Google aplica na primeira guia por padrao.
+// Inclui tableStartLocation (updateTableCellStyle) — sem isso as cores da tabela somem na guia certa.
 function withTabId(requests: unknown[], tabId?: string): unknown[] {
   if (!tabId) return requests;
 
+  const stamp = (value: unknown): void => {
+    if (!value || typeof value !== "object") return;
+    if (Array.isArray(value)) {
+      for (const item of value) stamp(item);
+      return;
+    }
+    const obj = value as Record<string, unknown>;
+    // Range: { startIndex, endIndex }
+    if (typeof obj.startIndex === "number" && typeof obj.endIndex === "number") {
+      obj.tabId = tabId;
+    }
+    // Location: { index } (nao confundir com Dimension { magnitude, unit })
+    if (
+      typeof obj.index === "number" &&
+      obj.magnitude === undefined &&
+      obj.unit === undefined
+    ) {
+      obj.tabId = tabId;
+    }
+    for (const child of Object.values(obj)) stamp(child);
+  };
+
   return requests.map((request) => {
     const clone = JSON.parse(JSON.stringify(request));
-    const inner = Object.values(clone)[0] as any;
-    if (inner?.range) inner.range.tabId = tabId;
-    if (inner?.location) inner.location.tabId = tabId;
+    stamp(clone);
     return clone;
   });
 }
@@ -651,7 +1140,15 @@ function isWholeLineMonospace(paragraph: any): boolean {
   return sawContent;
 }
 
-// Reconstroi a linha em Markdown, aplicando negrito/italico/codigo-inline/link por trecho (textRun)
+function getParagraphBorderBottomColor(paragraph: any): string | null {
+  const border = paragraph.paragraphStyle?.borderBottom;
+  const width = border?.width?.magnitude ?? 0;
+  if (width <= 0) return null;
+  const rgb = border?.color?.color?.rgbColor;
+  return rgb ? rgbColorToHex(rgb) : "#000000";
+}
+
+// Reconstroi a linha em Markdown, aplicando negrito/italico/fonte/tamanho/cor/link por trecho (textRun)
 function renderParagraphMarkdown(paragraph: any): string {
   const elements = paragraph.elements ?? [];
   let markdown = "";
@@ -664,7 +1161,12 @@ function renderParagraphMarkdown(paragraph: any): string {
     if (content.length === 0) continue;
 
     const style = run.textStyle ?? {};
-    const isMonospace = style.weightedFontFamily?.fontFamily === MONOSPACE_FONT_FAMILY;
+    const fontFamily: string | undefined = style.weightedFontFamily?.fontFamily;
+    const isMonospace = fontFamily === MONOSPACE_FONT_FAMILY;
+    const fontSizePt: number | undefined =
+      style.fontSize?.unit === "PT" && typeof style.fontSize?.magnitude === "number"
+        ? style.fontSize.magnitude
+        : undefined;
 
     let piece = content;
 
@@ -683,9 +1185,13 @@ function renderParagraphMarkdown(paragraph: any): string {
     }
 
     const rgbColor = style.foregroundColor?.color?.rgbColor;
-    if (rgbColor) {
-      piece = `<span style="color:${rgbColorToHex(rgbColor)}">${piece}</span>`;
-    }
+    const color = rgbColor ? rgbColorToHex(rgbColor) : undefined;
+    // Preserva Calibri/tamanho do Doc no Markdown (senao o Publish joga pra Arial padrao do Heading)
+    piece = wrapWithStyleSpan(piece, {
+      color,
+      fontFamily: !isMonospace && fontFamily ? fontFamily : undefined,
+      fontSizePt,
+    });
 
     markdown += piece;
   }
@@ -693,18 +1199,134 @@ function renderParagraphMarkdown(paragraph: any): string {
   return markdown;
 }
 
-// Consulta a lista global do Doc pra saber se esse item e numerado ou so com marcador
+// Consulta a lista global do Doc pra saber se esse item e numerado ou so com marcador.
+// Listas numeradas usam glyphType (DECIMAL, ALPHA, ROMAN...); listas com bullet usam glyphSymbol.
+const ORDERED_GLYPH_TYPES = new Set([
+  "DECIMAL",
+  "ZERO_DECIMAL",
+  "UPPER_ALPHA",
+  "ALPHA",
+  "UPPER_ROMAN",
+  "ROMAN",
+]);
+
 function isOrderedListItem(doc: any, listId: string, nestingLevel: number): boolean {
   const level = doc.lists?.[listId]?.listProperties?.nestingLevels?.[nestingLevel];
-  return Boolean(level?.glyphType);
+  if (!level) return false;
+  if (ORDERED_GLYPH_TYPES.has(level.glyphType)) return true;
+  // Alguns Docs so trazem glyphFormat ("%0.") sem glyphType preenchido
+  return typeof level.glyphFormat === "string" && /%\d/.test(level.glyphFormat);
 }
 
 type DocToken =
-  | { kind: "code"; text: string; startIndex?: number }
+  | { kind: "code"; text: string; startIndex?: number; language?: string }
   | { kind: "empty" }
-  | { kind: "bullet"; ordered: boolean; text: string }
-  | { kind: "heading"; level: number; text: string }
-  | { kind: "paragraph"; text: string };
+  | { kind: "bullet"; ordered: boolean; text: string; spacing?: ParagraphSpacing }
+  | { kind: "heading"; level: number; text: string; borderBottomColor?: string; spacing?: ParagraphSpacing }
+  | { kind: "paragraph"; text: string; spacing?: ParagraphSpacing }
+  | { kind: "table"; rows: TableCellData[][] }
+  | { kind: "callout"; title: string; body: string };
+
+function getTableCellPlainText(cell: any): string {
+  const lines: string[] = [];
+  for (const el of cell.content ?? []) {
+    if (!el.paragraph) continue;
+    lines.push(getParagraphPlainText(el.paragraph));
+  }
+  return lines.join("\n");
+}
+
+function getTableCellMarkdown(cell: any): string {
+  const parts: string[] = [];
+  for (const el of cell.content ?? []) {
+    if (!el.paragraph) continue;
+    const md = renderParagraphMarkdown(el.paragraph);
+    if (md.length > 0) parts.push(md);
+  }
+  return parts.join("<br>");
+}
+
+function getTableCellBackgroundHex(cell: any): string | undefined {
+  const rgb = cell.tableCellStyle?.backgroundColor?.color?.rgbColor;
+  if (!rgb) return undefined;
+  // Ignora branco/quase branco (fundo padrao)
+  const r = rgb.red ?? 0;
+  const g = rgb.green ?? 0;
+  const b = rgb.blue ?? 0;
+  if (r > 0.97 && g > 0.97 && b > 0.97) return undefined;
+  return rgbColorToHex(rgb);
+}
+
+function cellLooksLikeCode(cell: any): boolean {
+  const plain = getTableCellPlainText(cell);
+  const trimmed = plain.trim();
+  if (!trimmed) return false;
+  if (/[├└│─]/.test(trimmed)) return true; // arvore de pastas
+  if (/^[{[]/.test(trimmed)) return true; // JSON
+  if (/^(nvm |curl |vtex |npm |yarn |pnpm )/m.test(trimmed)) return true;
+
+  const paragraphs = (cell.content ?? []).filter((el: any) => el.paragraph);
+  let sawContent = false;
+  for (const el of paragraphs) {
+    const text = getParagraphPlainText(el.paragraph);
+    if (!text.trim()) continue;
+    sawContent = true;
+    if (!isWholeLineMonospace(el.paragraph)) return false;
+  }
+  return sawContent;
+}
+
+function tableLooksLikeCodeBlock(table: any): boolean {
+  const rows = table.tableRows ?? [];
+  if (rows.length !== 1) return false;
+  const cells = rows[0]?.tableCells ?? [];
+  if (cells.length !== 1) return false;
+  return cellLooksLikeCode(cells[0]);
+}
+
+// Caixa 1x1 de destaque (callout rosa) — no Obsidian vira > [!tip]
+function tableLooksLikeCallout(table: any): boolean {
+  if (tableLooksLikeCodeBlock(table)) return false;
+  const rows = table.tableRows ?? [];
+  if (rows.length !== 1) return false;
+  const cells = rows[0]?.tableCells ?? [];
+  if (cells.length !== 1) return false;
+  const cell = cells[0];
+  const plain = getTableCellPlainText(cell).trim();
+  if (!plain) return false;
+  if (getTableCellBackgroundHex(cell)) return true;
+  return /^(por que|dica|aten[cç][aã]o|importante|nota)\b/i.test(plain);
+}
+
+function guessCodeLanguage(text: string): string | undefined {
+  const t = text.trim();
+  if (/^[{\[]/.test(t)) return "json";
+  if (/^(nvm |curl |vtex |npm |yarn |pnpm |# )/m.test(t)) return "bash";
+  if (/[{};]|@font-face|\.[\w-]+\s*\{/m.test(t)) return "css";
+  return undefined;
+}
+
+function extractTableRows(table: any): TableCellData[][] {
+  const rows: TableCellData[][] = [];
+  for (const row of table.tableRows ?? []) {
+    const cells: TableCellData[] = [];
+    for (const cell of row.tableCells ?? []) {
+      cells.push({
+        text: getTableCellMarkdown(cell),
+        backgroundColor: getTableCellBackgroundHex(cell),
+      });
+    }
+    rows.push(cells);
+  }
+  return rows;
+}
+
+function splitCalloutTitleAndBody(plain: string): { title: string; body: string } {
+  const lines = plain.split("\n");
+  const title = (lines[0] ?? "").trim() || "Nota";
+  const body = lines.slice(1).join("\n").trim();
+  return { title, body };
+}
 
 // Le doc.namedRanges e monta a lista de trechos marcados com "essa faixa de indices e da linguagem X"
 function buildCodeLanguageRanges(doc: any): Array<{ start: number; end: number; language: string }> {
@@ -735,18 +1357,40 @@ function findCodeLanguage(
   return null;
 }
 
-// Percorre os paragrafos do Doc e classifica cada um, sem decidir ainda as linhas em branco ambiguas
+// Percorre o body do Doc (paragrafos E tabelas) e classifica cada elemento
 function tokenizeDocParagraphs(doc: any): DocToken[] {
   const bodyContent = doc.body?.content ?? [];
   const tokens: DocToken[] = [];
 
   for (const element of bodyContent) {
+    // Tabelas do Docs (callouts, caixas de codigo cinza, Campo/Descricao...) — antes eram puladas
+    if (element.table) {
+      if (tableLooksLikeCodeBlock(element.table)) {
+        const cell = element.table.tableRows[0].tableCells[0];
+        const text = getTableCellPlainText(cell);
+        tokens.push({
+          kind: "code",
+          text,
+          startIndex: element.startIndex,
+          language: guessCodeLanguage(text),
+        });
+      } else if (tableLooksLikeCallout(element.table)) {
+        const cell = element.table.tableRows[0].tableCells[0];
+        const { title, body } = splitCalloutTitleAndBody(getTableCellPlainText(cell));
+        tokens.push({ kind: "callout", title, body });
+      } else {
+        tokens.push({ kind: "table", rows: extractTableRows(element.table) });
+      }
+      continue;
+    }
+
     const paragraph = element.paragraph;
-    if (!paragraph) continue; // tabelas e outras estruturas ficam de fora por ora
+    if (!paragraph) continue;
 
     const plainText = getParagraphPlainText(paragraph);
     const namedStyle = paragraph.paragraphStyle?.namedStyleType ?? "NORMAL_TEXT";
     const bullet = paragraph.bullet;
+    const headingLevel = HEADING_NAMED_STYLES.indexOf(namedStyle) + 1;
 
     if (plainText.trim().length === 0 && !bullet) {
       tokens.push({ kind: "empty" });
@@ -758,19 +1402,29 @@ function tokenizeDocParagraphs(doc: any): DocToken[] {
       continue;
     }
 
+    const spacing = readParagraphSpacing(paragraph);
+
+    // Titulo com bullet residual (heranca do paragrafo sobrevivente no Publish): preferir o titulo,
+    // senao o Sync transforma "# Sumario" em item de lista e o proximo Publish cristaliza a corrupcao.
+    if (headingLevel > 0) {
+      const borderBottomColor = getParagraphBorderBottomColor(paragraph) ?? undefined;
+      tokens.push({
+        kind: "heading",
+        level: headingLevel,
+        text: renderParagraphMarkdown(paragraph),
+        borderBottomColor,
+        spacing,
+      });
+      continue;
+    }
+
     if (bullet) {
       const ordered = isOrderedListItem(doc, bullet.listId, bullet.nestingLevel ?? 0);
-      tokens.push({ kind: "bullet", ordered, text: renderParagraphMarkdown(paragraph) });
+      tokens.push({ kind: "bullet", ordered, text: renderParagraphMarkdown(paragraph), spacing });
       continue;
     }
 
-    const headingLevel = HEADING_NAMED_STYLES.indexOf(namedStyle) + 1;
-    if (headingLevel > 0) {
-      tokens.push({ kind: "heading", level: headingLevel, text: renderParagraphMarkdown(paragraph) });
-      continue;
-    }
-
-    tokens.push({ kind: "paragraph", text: renderParagraphMarkdown(paragraph) });
+    tokens.push({ kind: "paragraph", text: renderParagraphMarkdown(paragraph), spacing });
   }
 
   return tokens;
@@ -818,7 +1472,9 @@ function convertDocToMarkdown(doc: any, tabId?: string): string {
   for (const token of tokens) {
     if (token.kind === "code") {
       if (!inCodeBlock) {
-        const language = token.startIndex !== undefined ? findCodeLanguage(languageRanges, token.startIndex) : null;
+        const namedLang =
+          token.startIndex !== undefined ? findCodeLanguage(languageRanges, token.startIndex) : null;
+        const language = namedLang ?? token.language ?? null;
         lines.push(language ? "```" + language : "```");
         inCodeBlock = true;
       }
@@ -835,30 +1491,305 @@ function convertDocToMarkdown(doc: any, tabId?: string): string {
       continue;
     }
 
+    if (token.kind === "callout") {
+      orderedCounter = 0;
+      lines.push("");
+      lines.push(formatCalloutMarkdown(token.title, token.body));
+      lines.push("");
+      continue;
+    }
+
     if (token.kind === "bullet") {
-      if (token.ordered) {
+      // Sempre tira "1. " do texto — senao vira "1. 1. item" quando a lista ja e numerada
+      let itemText = token.text;
+      let ordered = token.ordered;
+      const stripped = stripLeadingManualNumber(itemText);
+      if (stripped.ordered) {
+        ordered = true;
+        itemText = stripped.content;
+      }
+
+      // Normaliza sb minimo no Markdown (Doc com sb=5 parece "grudado"; Sync ja grava o valor folgado)
+      const listSpacing: ParagraphSpacing = {
+        spaceAbovePt: token.spacing?.spaceAbovePt,
+        spaceBelowPt: Math.max(token.spacing?.spaceBelowPt ?? MIN_LIST_SPACE_BELOW_PT, MIN_LIST_SPACE_BELOW_PT),
+        lineSpacing: token.spacing?.lineSpacing ?? DEFAULT_LIST_SPACING.lineSpacing,
+      };
+      const spacingComment = formatSpacingComment(spacingForMarkdownExport(listSpacing) ?? {});
+      if (ordered) {
         orderedCounter += 1;
-        lines.push(`${orderedCounter}. ${token.text}`);
+        lines.push(`${orderedCounter}. ${itemText}${spacingComment}`);
       } else {
         orderedCounter = 0;
-        lines.push(`- ${token.text}`);
+        lines.push(`- ${itemText}${spacingComment}`);
       }
       continue;
     }
 
     orderedCounter = 0;
 
-    if (token.kind === "heading") {
-      lines.push(`${"#".repeat(token.level)} ${token.text}`);
+    if (token.kind === "table") {
+      const tableMd = formatTableMarkdown(token.rows);
+      if (tableMd) {
+        lines.push("");
+        lines.push(tableMd);
+        lines.push("");
+      }
       continue;
     }
 
-    lines.push(token.text);
+    if (token.kind === "heading") {
+      const spacingComment = formatSpacingComment(spacingForMarkdownExport(token.spacing ?? {}) ?? {});
+      lines.push(`${"#".repeat(token.level)} ${token.text}${spacingComment}`);
+      // Linha embaixo do titulo no Doc → --- no Markdown (o Publish recoloca como borderBottom)
+      if (token.borderBottomColor) {
+        lines.push("---");
+      }
+      continue;
+    }
+
+    const spacingComment = formatSpacingComment(spacingForMarkdownExport(token.spacing ?? {}) ?? {});
+    lines.push(`${token.text}${spacingComment}`);
   }
 
   closeCodeBlockIfOpen();
 
   return lines.join("\n");
+}
+
+async function docsBatchUpdate(
+  plugin: GoogleDocsHubPlugin,
+  docId: string,
+  requests: unknown[],
+  tabId?: string
+): Promise<void> {
+  if (requests.length === 0) return;
+  const updateResponse = await googleApiFetch(plugin, `${GOOGLE_DOCS_API_URL}/${docId}:batchUpdate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ requests: withTabId(requests, tabId) }),
+  });
+  if (!updateResponse.ok) {
+    const errorBody = await updateResponse.text();
+    throw new Error(`Falha ao atualizar o Doc (HTTP ${updateResponse.status}): ${errorBody}`);
+  }
+}
+
+function getDocBodyEndIndex(doc: any, tabId?: string): number {
+  const { body } = resolveDocForTab(doc, tabId);
+  const bodyContent = body?.content ?? [];
+  const lastElement = bodyContent[bodyContent.length - 1];
+  return lastElement?.endIndex ?? 1;
+}
+
+function findLastTableElement(doc: any, tabId?: string): any | null {
+  const { body } = resolveDocForTab(doc, tabId);
+  const content = body?.content ?? [];
+  for (let i = content.length - 1; i >= 0; i--) {
+    if (content[i].table) return content[i];
+  }
+  return null;
+}
+
+function getTableCellInsertIndex(cell: any): number | null {
+  for (const el of cell.content ?? []) {
+    if (el.paragraph && typeof el.startIndex === "number") {
+      return el.startIndex;
+    }
+  }
+  return null;
+}
+
+async function clearDocBody(
+  plugin: GoogleDocsHubPlugin,
+  doc: any,
+  docId: string,
+  tabId?: string
+): Promise<void> {
+  const endIndex = getDocBodyEndIndex(doc, tabId);
+  const clearBorder = {
+    width: { magnitude: 0, unit: "PT" },
+    padding: { magnitude: 0, unit: "PT" },
+    dashStyle: "SOLID",
+    color: { color: { rgbColor: { red: 0, green: 0, blue: 0 } } },
+  };
+  const requests: unknown[] = [];
+  if (endIndex > 2) {
+    requests.push({ deleteContentRange: { range: { startIndex: 1, endIndex: endIndex - 1 } } });
+  }
+  requests.push({
+    deleteParagraphBullets: { range: { startIndex: 1, endIndex: 2 } },
+  });
+  requests.push({
+    updateParagraphStyle: {
+      range: { startIndex: 1, endIndex: 2 },
+      paragraphStyle: {
+        namedStyleType: "NORMAL_TEXT",
+        indentStart: { magnitude: 0, unit: "PT" },
+        indentFirstLine: { magnitude: 0, unit: "PT" },
+        borderTop: clearBorder,
+        borderBottom: clearBorder,
+        borderLeft: clearBorder,
+        borderRight: clearBorder,
+      },
+      fields: "namedStyleType,indentStart,indentFirstLine,borderTop,borderBottom,borderLeft,borderRight",
+    },
+  });
+  await docsBatchUpdate(plugin, docId, requests, tabId);
+}
+
+async function appendBlocksToDoc(
+  plugin: GoogleDocsHubPlugin,
+  docId: string,
+  tabId: string | undefined,
+  blocks: MarkdownBlock[]
+): Promise<void> {
+  if (blocks.length === 0) return;
+  const doc = await fetchGoogleDoc(plugin, docId);
+  const endIndex = getDocBodyEndIndex(doc, tabId);
+  const insertAt = Math.max(1, endIndex - 1);
+
+  const { text, paragraphStyleRequests, spacingRequests, textStyleRequests } =
+    buildDocRequestsFromBlocks(blocks, insertAt);
+  if (text.length === 0) return;
+
+  await docsBatchUpdate(
+    plugin,
+    docId,
+    [{ insertText: { location: { index: insertAt }, text } }, ...paragraphStyleRequests],
+    tabId
+  );
+  await docsBatchUpdate(plugin, docId, spacingRequests, tabId);
+  await docsBatchUpdate(plugin, docId, textStyleRequests, tabId);
+}
+
+const CALLOUT_CELL_BG = "#fdf0f5"; // rosa claro tipico das caixas "Dica" / "Por que IO?"
+const CODE_CELL_BG = "#f2f2f2"; // caixa cinza de codigo no Docs
+
+function calloutToTableRows(title: string, body: string): TableCellData[][] {
+  const text = body.trim() ? `**${title}**\n${body}` : `**${title}**`;
+  return [[{ text, backgroundColor: CALLOUT_CELL_BG }]];
+}
+
+function codeBlockToTableRows(text: string): TableCellData[][] {
+  return [[{ text, backgroundColor: CODE_CELL_BG, monospace: true }]];
+}
+
+async function appendTableToDoc(
+  plugin: GoogleDocsHubPlugin,
+  docId: string,
+  tabId: string | undefined,
+  rows: TableCellData[][]
+): Promise<void> {
+  if (rows.length === 0) return;
+  const colCount = Math.max(...rows.map((r) => r.length), 1);
+  const normalized = rows.map((r) => {
+    const padded = [...r];
+    while (padded.length < colCount) padded.push({ text: "" });
+    return padded;
+  });
+
+  const doc = await fetchGoogleDoc(plugin, docId);
+  const endIndex = getDocBodyEndIndex(doc, tabId);
+  const insertAt = Math.max(1, endIndex - 1);
+
+  // 1) cria grade vazia
+  await docsBatchUpdate(
+    plugin,
+    docId,
+    [
+      {
+        insertTable: {
+          rows: normalized.length,
+          columns: colCount,
+          location: { index: insertAt },
+        },
+      },
+    ],
+    tabId
+  );
+
+  // 2) relê o Doc pra achar os startIndex de cada celula
+  const updated = await fetchGoogleDoc(plugin, docId);
+  const tableElement = findLastTableElement(updated, tabId);
+  if (!tableElement?.table || typeof tableElement.startIndex !== "number") return;
+
+  type CellFill = { index: number; plain: string };
+  const fills: CellFill[] = [];
+  const tableRows = tableElement.table.tableRows ?? [];
+
+  for (let r = 0; r < normalized.length; r++) {
+    for (let c = 0; c < colCount; c++) {
+      const cell = tableRows[r]?.tableCells?.[c];
+      if (!cell) continue;
+      const cellIndex = getTableCellInsertIndex(cell);
+      const cellData = normalized[r][c];
+      if (cellIndex == null) continue;
+      const plain = inlineTokensToPlain(cellMarkdownToInlineTokens(cellData.text));
+      if (!plain) continue;
+      fills.push({ index: cellIndex, plain });
+    }
+  }
+
+  // 3) preenche de tras pra frente pra os indices nao deslocarem uns aos outros
+  fills.sort((a, b) => b.index - a.index);
+  if (fills.length > 0) {
+    await docsBatchUpdate(
+      plugin,
+      docId,
+      fills.map(({ index, plain }) => ({
+        insertText: { location: { index }, text: plain },
+      })),
+      tabId
+    );
+  }
+
+  // 4) cores de fundo + estilos inline (negrito/cor/fonte) — relê indices apos insertText
+  const styled = await fetchGoogleDoc(plugin, docId);
+  const styledTable = findLastTableElement(styled, tabId);
+  if (!styledTable?.table || typeof styledTable.startIndex !== "number") return;
+
+  const styleRequests: unknown[] = [];
+  const styledRows = styledTable.table.tableRows ?? [];
+  for (let r = 0; r < normalized.length; r++) {
+    for (let c = 0; c < colCount; c++) {
+      const cellData = normalized[r][c];
+      const cell = styledRows[r]?.tableCells?.[c];
+      if (!cell) continue;
+
+      if (cellData.backgroundColor) {
+        styleRequests.push({
+          updateTableCellStyle: {
+            tableRange: {
+              tableCellLocation: {
+                tableStartLocation: { index: styledTable.startIndex },
+                rowIndex: r,
+                columnIndex: c,
+              },
+              // API exige rowSpan/columnSpan > 0 (omitidos viram 0 → HTTP 400)
+              rowSpan: 1,
+              columnSpan: 1,
+            },
+            tableCellStyle: {
+              backgroundColor: {
+                color: { rgbColor: hexToRgbColor(cellData.backgroundColor) },
+              },
+            },
+            fields: "backgroundColor",
+          },
+        });
+      }
+
+      const cellIndex = getTableCellInsertIndex(cell);
+      if (cellIndex == null) continue;
+      const tokens = cellMarkdownToInlineTokens(cellData.text);
+      styleRequests.push(
+        ...buildTextStyleRequestsForTokens(tokens, cellIndex, Boolean(cellData.monospace))
+      );
+    }
+  }
+
+  await docsBatchUpdate(plugin, docId, styleRequests, tabId);
 }
 
 async function publishNoteToDoc(
@@ -868,35 +1799,38 @@ async function publishNoteToDoc(
   markdown: string,
   tabId?: string
 ): Promise<void> {
-  const { body } = resolveDocForTab(doc, tabId);
-  const bodyContent = body?.content ?? [];
-  const lastElement = bodyContent[bodyContent.length - 1];
-  const endIndex = lastElement?.endIndex ?? 1;
+  const blocks = parseMarkdownBlocks(markdown);
+  await clearDocBody(plugin, doc, docId, tabId);
 
-  const { text, styleRequests } = buildDocRequestsFromMarkdown(markdown);
+  const isStructural = (b: MarkdownBlock) =>
+    b.type === "table" || b.type === "callout" || b.type === "code";
 
-  const requests: unknown[] = [];
+  // Publica em segmentos: texto/listas, tabelas/callouts/codigo-caixa (API exige re-get)
+  let i = 0;
+  while (i < blocks.length) {
+    const block = blocks[i];
+    if (block.type === "table") {
+      await appendTableToDoc(plugin, docId, tabId, block.rows);
+      i++;
+      continue;
+    }
+    if (block.type === "callout") {
+      await appendTableToDoc(plugin, docId, tabId, calloutToTableRows(block.title, block.body));
+      i++;
+      continue;
+    }
+    if (block.type === "code") {
+      await appendTableToDoc(plugin, docId, tabId, codeBlockToTableRows(block.text));
+      i++;
+      continue;
+    }
 
-  if (endIndex > 2) {
-    requests.push({ deleteContentRange: { range: { startIndex: 1, endIndex: endIndex - 1 } } });
-  }
-
-  if (text.length > 0) {
-    requests.push({ insertText: { location: { index: 1 }, text } });
-    requests.push(...styleRequests);
-  }
-
-  if (requests.length === 0) return;
-
-  const updateResponse = await googleApiFetch(plugin, `${GOOGLE_DOCS_API_URL}/${docId}:batchUpdate`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ requests: withTabId(requests, tabId) }),
-  });
-
-  if (!updateResponse.ok) {
-    const errorBody = await updateResponse.text();
-    throw new Error(`Falha ao atualizar o Doc (HTTP ${updateResponse.status}): ${errorBody}`);
+    const chunk: MarkdownBlock[] = [];
+    while (i < blocks.length && !isStructural(blocks[i])) {
+      chunk.push(blocks[i]);
+      i++;
+    }
+    await appendBlocksToDoc(plugin, docId, tabId, chunk);
   }
 }
 
@@ -932,6 +1866,9 @@ async function runSyncFlow(plugin: GoogleDocsHubPlugin, file: TFile, doc: any, t
   new Notice("Trazendo o conteudo do Google Docs para a nota...");
   try {
     const docText = convertDocToMarkdown(doc, tabId);
+    const tableCount = (docText.match(/^\| .+\|$/gm) || []).length;
+    const codeFenceCount = Math.floor((docText.match(/^```/gm) || []).length / 2);
+
     await plugin.app.vault.process(file, (data) => {
       const frontmatterMatch = data.match(FRONTMATTER_BLOCK_PATTERN);
       const frontmatterBlock = frontmatterMatch ? frontmatterMatch[0] : "";
@@ -944,7 +1881,12 @@ async function runSyncFlow(plugin: GoogleDocsHubPlugin, file: TFile, doc: any, t
       fm[FRONTMATTER_LAST_SYNCED_HASH_KEY] = newHash;
     });
 
-    new Notice("Nota atualizada com o conteudo do Google Docs.");
+    new Notice(
+      `Nota atualizada com o Google Docs` +
+        (tableCount || codeFenceCount
+          ? ` (${tableCount} linha(s) de tabela, ${codeFenceCount} bloco(s) de codigo).`
+          : ".")
+    );
   } catch (err) {
     console.error(err);
     new Notice(`Falha ao sincronizar: ${(err as Error).message}`);
@@ -992,11 +1934,18 @@ class MergeReviewModal extends Modal {
   private choices: HunkChoice[];
   private onResolve: (merged: string) => void;
 
-  constructor(app: App, localContent: string, remoteContent: string, onResolve: (merged: string) => void) {
+  constructor(
+    app: App,
+    localContent: string,
+    remoteContent: string,
+    onResolve: (merged: string) => void,
+    defaultChoice: HunkChoice = "remote"
+  ) {
     super(app);
     const diff = diffLines(localContent.split("\n"), remoteContent.split("\n"));
     this.hunks = groupIntoHunks(diff);
-    this.choices = this.hunks.map(() => "both");
+    // "both" por padrao duplicava nota+Doc (ex: "1. 1. item") e destruia a formatacao
+    this.choices = this.hunks.map(() => defaultChoice);
     this.onResolve = onResolve;
   }
 
@@ -1134,9 +2083,16 @@ async function publishNoteCommand(plugin: GoogleDocsHubPlugin, file: TFile): Pro
     const remoteChanged = hasPriorSync && hashContent(remoteContent) !== lastHash;
 
     if (remoteChanged) {
-      new MergeReviewModal(plugin.app, content, remoteContent, (merged) => {
-        applyMergedContent(plugin, file, docId, merged, tabId);
-      }).open();
+      // Publish: padrao = manter a nota (o que o usuario esta tentando enviar)
+      new MergeReviewModal(
+        plugin.app,
+        content,
+        remoteContent,
+        (merged) => {
+          applyMergedContent(plugin, file, docId, merged, tabId);
+        },
+        "local"
+      ).open();
       return;
     }
 
@@ -1171,9 +2127,16 @@ async function syncNowCommand(plugin: GoogleDocsHubPlugin, file: TFile): Promise
 
     if (localChanged) {
       const remoteContent = convertDocToMarkdown(doc, tabId);
-      new MergeReviewModal(plugin.app, localContent, remoteContent, (merged) => {
-        applyMergedContent(plugin, file, docId, merged, tabId);
-      }).open();
+      // Sync: padrao = manter o Doc (hub), pra nao perder Calibri/espacamento/linha do titulo
+      new MergeReviewModal(
+        plugin.app,
+        localContent,
+        remoteContent,
+        (merged) => {
+          applyMergedContent(plugin, file, docId, merged, tabId);
+        },
+        "remote"
+      ).open();
       return;
     }
 
