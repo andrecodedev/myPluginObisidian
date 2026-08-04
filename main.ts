@@ -1357,6 +1357,25 @@ async function googleApiFetch(
   };
 }
 
+/**
+ * Quota padrao Google Docs: WriteRequestsPerMinutePerUser = 60.
+ * Cada documents.batchUpdate conta 1 write. Sem espaçamento, Publish grande estoura 429.
+ */
+const DOCS_WRITE_MIN_INTERVAL_MS = 1200;
+let lastDocsWriteAt = 0;
+
+async function waitForDocsWriteSlot(noticeOnWait = false): Promise<void> {
+  const now = Date.now();
+  const waitMs = lastDocsWriteAt + DOCS_WRITE_MIN_INTERVAL_MS - now;
+  if (waitMs > 0) {
+    if (noticeOnWait && waitMs > 800) {
+      new Notice(`Aguardando cota do Google Docs (~${Math.ceil(waitMs / 1000)}s)...`);
+    }
+    await new Promise((r) => setTimeout(r, waitMs));
+  }
+  lastDocsWriteAt = Date.now();
+}
+
 // includeTabsContent=true e obrigatorio pra API devolver o conteudo de TODAS as guias do Doc,
 // nao so a primeira (esse e o comportamento padrao do Google se a gente nao pedir explicitamente)
 async function fetchGoogleDoc(plugin: GoogleDocsHubPlugin, docId: string): Promise<any> {
@@ -2225,16 +2244,47 @@ async function docsBatchUpdate(
   tabId?: string
 ): Promise<any> {
   if (requests.length === 0) return {};
-  const updateResponse = await googleApiFetch(plugin, `${GOOGLE_DOCS_API_URL}/${docId}:batchUpdate`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ requests: withTabId(requests, tabId) }),
-  });
-  if (!updateResponse.ok) {
-    const errorBody = await updateResponse.text();
-    throw new Error(`Falha ao atualizar o Doc (HTTP ${updateResponse.status}): ${errorBody}`);
+
+  // Max por chamada (~500). Usar o teto reduz quantas HTTP writes batem na cota de 60/min.
+  const DOCS_BATCH_LIMIT = 500;
+  let lastJson: any = {};
+
+  for (let offset = 0; offset < requests.length; offset += DOCS_BATCH_LIMIT) {
+    const slice = requests.slice(offset, offset + DOCS_BATCH_LIMIT);
+    let attempt = 0;
+    while (true) {
+      attempt++;
+      await waitForDocsWriteSlot(attempt === 1 && offset > 0);
+      const updateResponse = await googleApiFetch(plugin, `${GOOGLE_DOCS_API_URL}/${docId}:batchUpdate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ requests: withTabId(slice, tabId) }),
+      });
+      if (updateResponse.ok) {
+        lastJson = await updateResponse.json();
+        break;
+      }
+      const errorBody = await updateResponse.text();
+      const is429 = updateResponse.status === 429;
+      const retryable =
+        is429 || updateResponse.status === 500 || updateResponse.status === 503;
+      if (retryable && attempt < 6) {
+        // 429: cota 60/min — espera a janela virar (nao adianta retry em 0.5s)
+        const backoffMs = is429 ? 65_000 + (attempt - 1) * 15_000 : 800 * attempt * attempt;
+        new Notice(
+          is429
+            ? `Cota Google Docs esgotada (60 writes/min). Retomando em ~${Math.ceil(backoffMs / 1000)}s...`
+            : `Erro HTTP ${updateResponse.status}. Tentando de novo...`
+        );
+        await new Promise((r) => setTimeout(r, backoffMs));
+        lastDocsWriteAt = 0;
+        continue;
+      }
+      throw new Error(`Falha ao atualizar o Doc (HTTP ${updateResponse.status}): ${errorBody}`);
+    }
   }
-  return updateResponse.json();
+
+  return lastJson;
 }
 
 function getDocBodyEndIndex(doc: any, tabId?: string): number {
@@ -2315,12 +2365,14 @@ async function appendBlocksToDoc(
     buildDocRequestsFromBlocks(blocks, insertAt);
   if (text.length === 0) return;
 
+  // insertText sozinho primeiro (corpo grande); estilos em batches separados via docsBatchUpdate
   await docsBatchUpdate(
     plugin,
     docId,
-    [{ insertText: { location: { index: insertAt }, text } }, ...paragraphStyleRequests],
+    [{ insertText: { location: { index: insertAt }, text } }],
     tabId
   );
+  await docsBatchUpdate(plugin, docId, paragraphStyleRequests, tabId);
   await docsBatchUpdate(plugin, docId, spacingRequests, tabId);
   await docsBatchUpdate(plugin, docId, textStyleRequests, tabId);
 }
@@ -2904,6 +2956,9 @@ interface HubProgress {
 function countPublishUnits(blocks: MarkdownBlock[]): number {
   const isStructural = (b: MarkdownBlock) =>
     b.type === "table" || b.type === "callout" || b.type === "code" || b.type === "image";
+  // Fatia texto longo: API/timeout param na metade em notas grandes.
+  const MAX_TEXT_BLOCKS = 50;
+  const MAX_TEXT_CHARS = 25_000;
   let units = 0;
   let i = 0;
   while (i < blocks.length) {
@@ -2912,7 +2967,18 @@ function countPublishUnits(blocks: MarkdownBlock[]): number {
       i++;
       continue;
     }
-    while (i < blocks.length && !isStructural(blocks[i])) i++;
+    let chars = 0;
+    let n = 0;
+    while (i < blocks.length && !isStructural(blocks[i])) {
+      const estimated =
+        "text" in blocks[i] && typeof (blocks[i] as { text?: string }).text === "string"
+          ? String((blocks[i] as { text: string }).text).length + 8
+          : 32;
+      if (n > 0 && (n >= MAX_TEXT_BLOCKS || chars + estimated > MAX_TEXT_CHARS)) break;
+      chars += estimated;
+      n++;
+      i++;
+    }
     units++;
   }
   return Math.max(units, 1);
@@ -3008,8 +3074,22 @@ async function publishNoteToDoc(
     }
 
     const chunk: MarkdownBlock[] = [];
+    let chunkChars = 0;
+    const MAX_TEXT_BLOCKS = 50;
+    const MAX_TEXT_CHARS = 25_000;
     while (i < blocks.length && !isStructural(blocks[i])) {
+      const estimated =
+        "text" in blocks[i] && typeof (blocks[i] as { text?: string }).text === "string"
+          ? String((blocks[i] as { text: string }).text).length + 8
+          : 32;
+      if (
+        chunk.length > 0 &&
+        (chunk.length >= MAX_TEXT_BLOCKS || chunkChars + estimated > MAX_TEXT_CHARS)
+      ) {
+        break;
+      }
       chunk.push(blocks[i]);
+      chunkChars += estimated;
       i++;
     }
     progress?.set("Publicando texto...", Math.round((step / totalSteps) * 100));
