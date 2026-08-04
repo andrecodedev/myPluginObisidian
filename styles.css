@@ -64,16 +64,193 @@
 	margin-top: 8px;
 }
 
-.gdocs-hub-action {
-	color: var(--gdocs-hub-action-color);
+/* --- Botoes da barra do editor --- */
+
+.view-header .gdocs-hub-action {
 	display: inline-flex;
 	align-items: center;
-	gap: 4px;
+	gap: 6px;
 	width: auto;
+	height: auto;
+	min-height: 26px;
+	margin: 0 3px;
+	padding: 3px 10px 3px 8px;
+	border-radius: 6px;
+	border: 1px solid transparent;
 	white-space: nowrap;
+	opacity: 1;
+	transition: background 0.15s ease, border-color 0.15s ease, opacity 0.15s ease;
 }
 
-.gdocs-hub-action-label {
-	font-size: 0.7em;
-	color: var(--text-muted);
+.view-header .gdocs-hub-action .svg-icon {
+	width: 14px;
+	height: 14px;
+}
+
+.view-header .gdocs-hub-action-label {
+	font-size: 11px;
+	font-weight: 600;
+	letter-spacing: 0.01em;
+	line-height: 1;
+	color: inherit;
+}
+
+.view-header .gdocs-hub-action-publish {
+	color: #8ab4f8;
+	background: rgba(66, 133, 244, 0.12);
+	border-color: rgba(66, 133, 244, 0.28);
+}
+
+.view-header .gdocs-hub-action-publish:hover {
+	background: rgba(66, 133, 244, 0.22);
+}
+
+.view-header .gdocs-hub-action-sync {
+	color: #81c995;
+	background: rgba(52, 168, 83, 0.12);
+	border-color: rgba(52, 168, 83, 0.28);
+}
+
+.view-header .gdocs-hub-action-sync:hover {
+	background: rgba(52, 168, 83, 0.22);
+}
+
+.view-header .gdocs-hub-action-link {
+	color: #f28b82;
+	background: rgba(234, 67, 53, 0.1);
+	border-color: rgba(234, 67, 53, 0.28);
+}
+
+.view-header .gdocs-hub-action-link:hover {
+	background: rgba(234, 67, 53, 0.2);
+}
+
+.view-header .gdocs-hub-action-unlink {
+	color: #fdd663;
+	background: rgba(249, 171, 0, 0.12);
+	border-color: rgba(249, 171, 0, 0.3);
+}
+
+.view-header .gdocs-hub-action-unlink:hover {
+	background: rgba(249, 171, 0, 0.22);
+}
+
+.view-header .gdocs-hub-action-tabs {
+	color: #c58af9;
+	background: rgba(162, 113, 242, 0.12);
+	border-color: rgba(162, 113, 242, 0.3);
+}
+
+.view-header .gdocs-hub-action-tabs:hover {
+	background: rgba(162, 113, 242, 0.22);
+}
+
+.view-header .gdocs-hub-action-create {
+	color: #78d4c8;
+	background: rgba(38, 166, 154, 0.12);
+	border-color: rgba(38, 166, 154, 0.32);
+}
+
+.view-header .gdocs-hub-action-create:hover {
+	background: rgba(38, 166, 154, 0.24);
+}
+
+.view-header .gdocs-hub-action.is-disabled {
+	opacity: 0.45;
+	pointer-events: none;
+}
+
+.view-header .gdocs-hub-action.is-loading {
+	opacity: 1;
+	pointer-events: none;
+}
+
+.view-header .gdocs-hub-action-spinner {
+	display: none;
+	width: 10px;
+	height: 10px;
+	border: 2px solid currentColor;
+	border-right-color: transparent;
+	border-radius: 50%;
+	animation: gdocs-hub-spin 0.7s linear infinite;
+}
+
+.view-header .gdocs-hub-action.is-loading .gdocs-hub-action-spinner {
+	display: inline-block;
+}
+
+.view-header .gdocs-hub-action.is-loading .svg-icon {
+	display: none;
+}
+
+@keyframes gdocs-hub-spin {
+	to {
+		transform: rotate(360deg);
+	}
+}
+
+/* --- Banner de progresso no header da nota --- */
+
+.gdocs-hub-progress-banner {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	flex: 1 1 auto;
+	min-width: 160px;
+	max-width: 420px;
+	margin: 0 8px;
+	padding: 4px 10px;
+	border-radius: 8px;
+	background: rgba(66, 133, 244, 0.1);
+	border: 1px solid rgba(66, 133, 244, 0.25);
+	order: -1;
+}
+
+.gdocs-hub-progress-banner-label {
+	flex: 0 1 auto;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-size: 11px;
+	font-weight: 600;
+	color: var(--text-normal);
+}
+
+.gdocs-hub-progress-banner-track {
+	flex: 1 1 80px;
+	height: 6px;
+	border-radius: 99px;
+	background: rgba(255, 255, 255, 0.08);
+	overflow: hidden;
+}
+
+.gdocs-hub-progress-banner-fill {
+	height: 100%;
+	width: 0%;
+	border-radius: 99px;
+	background: linear-gradient(90deg, #4285f4, #34a853);
+	transition: width 0.2s ease;
+}
+
+.gdocs-hub-progress-banner-pct {
+	flex: 0 0 auto;
+	font-size: 11px;
+	font-weight: 700;
+	font-variant-numeric: tabular-nums;
+	color: #8ab4f8;
+	min-width: 2.4em;
+	text-align: right;
+}
+
+/* Status bar */
+.gdocs-hub-status.is-busy {
+	color: #8ab4f8;
+	font-weight: 600;
+}
+
+.gdocs-hub-muted {
+	opacity: 0.75;
+	font-size: 0.9em;
+	margin-top: 4px;
 }

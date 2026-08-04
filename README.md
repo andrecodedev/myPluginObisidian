@@ -30,12 +30,12 @@ Google Docs is often where non-technical collaborators (a manager, a client) rea
 - **Access token / refresh token**: obtained after you authorize through Google's own login screen. Stored locally in the same `data.json`, used only to call the Google Docs API on your behalf. You can revoke access at any time from [myaccount.google.com/permissions](https://myaccount.google.com/permissions).
 - **Per-note sync metadata** (`google_doc_id`, `google_doc_url`, and the last-synced revision id / content hash): stored in the note's own frontmatter, so the link between a note and a Doc survives renaming or moving the file.
 
-This plugin makes network requests only to `accounts.google.com`, `oauth2.googleapis.com`, and `docs.googleapis.com`, and only when you explicitly run a command (Connect, Publish, or Sync). No analytics, telemetry, or third-party services are used.
+This plugin makes network requests only to `accounts.google.com`, `oauth2.googleapis.com`, `docs.googleapis.com`, `www.googleapis.com` (Drive upload for images), and `drive.google.com` / `*.googleusercontent.com` (image fetch), and only when you explicitly run a command (Connect, Publish, or Sync). No analytics, telemetry, or third-party services are used.
 
 ## Known limitations
 
-- Tables are not translated between Markdown and Google Docs (Docs' table structure requires a second API round trip that is not implemented yet).
-- Obsidian-specific syntax (wikilinks, embeds, plugin-specific code blocks) has no Google Docs equivalent and is kept as literal text.
+- Tables are translated between Markdown/HTML and Google Docs (cell colors included).
+- Obsidian-specific syntax (wikilinks, embeds other than images, plugin-specific code blocks) has no Google Docs equivalent and is kept as literal text, except local images (`![[...]]` / `![](...)`) which are uploaded to Drive and inserted as real inline images on Publish.
 - Conflict resolution is a two-way diff (note vs. Doc), not a three-way merge against a common ancestor.
 
 ## Desktop only

@@ -7,6 +7,7 @@ import {
   PluginSettingTab,
   Setting,
   TFile,
+  TFolder,
   requestUrl,
 } from "obsidian";
 import { randomBytes, createHash } from "crypto";
@@ -26,11 +27,28 @@ const FRONTMATTER_DOC_URL_KEY = "google_doc_url";
 const FRONTMATTER_DOC_TAB_ID_KEY = "google_doc_tab_id";
 const FRONTMATTER_LAST_SYNCED_REVISION_KEY = "google_doc_last_synced_revision_id";
 const FRONTMATTER_LAST_SYNCED_HASH_KEY = "google_doc_last_synced_content_hash";
+/** Marca nota como mapa local do Obsidian (nunca é guia / não sobe pro Docs). */
+const FRONTMATTER_HUB_MAPA_KEY = "gdocs_hub_mapa";
 
 const GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 const GOOGLE_DOCS_API_URL = "https://docs.googleapis.com/v1/documents";
-const OAUTH_SCOPE = "https://www.googleapis.com/auth/documents";
+const OAUTH_SCOPE = [
+  "https://www.googleapis.com/auth/documents",
+  // Drive completo: move Docs existentes pra pasta do hub (drive.file so controla arquivos criados pelo app)
+  "https://www.googleapis.com/auth/drive",
+].join(" ");
+const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive";
+const DRIVE_SCOPE_FILE_ONLY = "https://www.googleapis.com/auth/drive.file";
+const GOOGLE_DRIVE_UPLOAD_URL = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart";
+const GOOGLE_DRIVE_UPLOAD_API_URL = "https://www.googleapis.com/upload/drive/v3/files";
+const GOOGLE_DRIVE_API_URL = "https://www.googleapis.com/drive/v3/files";
+const GOOGLE_TOKENINFO_URL = "https://oauth2.googleapis.com/tokeninfo";
+/** Pasta raiz no Drive onde cada Doc ganha uma subpasta com o Doc + imagens do Publish. */
+const DRIVE_HUB_ROOT_FOLDER_NAME = "Google Docs Hub";
+// Pasta de midia sem underscore: "_" no Markdown vira italico e corrompe !_gdocs_media/...
+const GDOCS_MEDIA_FOLDER = "gdocs-media";
+const GDOCS_MEDIA_FOLDER_LEGACY = "_gdocs_media";
 const OAUTH_TIMEOUT_MS = 5 * 60 * 1000;
 const TOKEN_EXPIRY_SAFETY_MARGIN_MS = 60 * 1000;
 const FRONTMATTER_BLOCK_PATTERN = /^---\n[\s\S]*?\n---\n/;
@@ -41,17 +59,26 @@ interface GoogleDocsHubSettings {
   accessToken?: string;
   refreshToken?: string;
   accessTokenExpiresAt?: number;
+  /** Escopos do ultimo Connect (pra saber se Drive ja foi autorizado). */
+  grantedScopes?: string;
+  /**
+   * Cache: sha256 do binario da imagem → Drive file id.
+   * Evita re-upload no Publish (cada Publish limpava o Doc e subia PNG de novo).
+   */
+  driveImageCache?: Record<string, string>;
 }
 
 const DEFAULT_SETTINGS: GoogleDocsHubSettings = {
   clientId: "",
   clientSecret: "",
+  driveImageCache: {},
 };
 
 interface TokenSet {
   accessToken: string;
   refreshToken: string;
   expiresAt: number;
+  grantedScopes?: string;
 }
 
 interface InlineToken {
@@ -61,13 +88,25 @@ interface InlineToken {
   code?: boolean;
   link?: string;
   color?: string;
+  /** Marca-texto / highlight do Google Docs (backgroundColor do textRun). */
+  highlight?: string;
   fontFamily?: string;
   fontSizePt?: number;
 }
 
-// Parseia o atributo style="" de um <span> (color, font-family, font-size)
-function parseCssStyleAttr(style: string): { color?: string; fontFamily?: string; fontSizePt?: number } {
-  const result: { color?: string; fontFamily?: string; fontSizePt?: number } = {};
+// Parseia o atributo style="" de um <span> (color, font-family, font-size, background)
+function parseCssStyleAttr(style: string): {
+  color?: string;
+  highlight?: string;
+  fontFamily?: string;
+  fontSizePt?: number;
+} {
+  const result: {
+    color?: string;
+    highlight?: string;
+    fontFamily?: string;
+    fontSizePt?: number;
+  } = {};
   for (const part of style.split(";")) {
     const colon = part.indexOf(":");
     if (colon === -1) continue;
@@ -75,6 +114,9 @@ function parseCssStyleAttr(style: string): { color?: string; fontFamily?: string
     const val = part.slice(colon + 1).trim();
     if (key === "color" && /^#[0-9a-fA-F]{6}$/i.test(val)) {
       result.color = val.toLowerCase();
+    } else if ((key === "background-color" || key === "background") && /^#[0-9a-fA-F]{6}/i.test(val)) {
+      const hex = /^#[0-9a-fA-F]{6}/i.exec(val)?.[0];
+      if (hex) result.highlight = hex.toLowerCase();
     } else if (key === "font-family" && val) {
       result.fontFamily = val.replace(/^["']|["']$/g, "").trim();
     } else if (key === "font-size") {
@@ -87,12 +129,13 @@ function parseCssStyleAttr(style: string): { color?: string; fontFamily?: string
 
 function wrapWithStyleSpan(
   piece: string,
-  opts: { color?: string; fontFamily?: string; fontSizePt?: number }
+  opts: { color?: string; highlight?: string; fontFamily?: string; fontSizePt?: number }
 ): string {
   const styles: string[] = [];
   if (opts.fontFamily) styles.push(`font-family:${opts.fontFamily}`);
   if (opts.fontSizePt != null) styles.push(`font-size:${opts.fontSizePt}pt`);
   if (opts.color) styles.push(`color:${opts.color}`);
+  if (opts.highlight) styles.push(`background-color:${opts.highlight}`);
   if (styles.length === 0) return piece;
   return `<span style="${styles.join(";")}">${piece}</span>`;
 }
@@ -122,19 +165,27 @@ interface ParagraphSpacing {
 interface TableCellData {
   text: string;
   backgroundColor?: string; // "#rrggbb" do tableCellStyle do Docs
+  /** Borda “de destaque” (mais grossa ou colorida) — Obsidian HTML nao tem 4 bordas independentes. */
+  borderColor?: string;
+  borderWidthPt?: number;
   monospace?: boolean; // caixa de codigo 1x1
 }
 
 type MarkdownBlock =
   | { type: "heading"; level: number; tokens: InlineToken[]; spacing?: ParagraphSpacing }
   | { type: "bullet"; tokens: InlineToken[]; spacing?: ParagraphSpacing }
+  | { type: "checkbox"; checked: boolean; tokens: InlineToken[]; spacing?: ParagraphSpacing }
   | { type: "numbered"; tokens: InlineToken[]; spacing?: ParagraphSpacing }
   | { type: "paragraph"; tokens: InlineToken[]; spacing?: ParagraphSpacing }
+  | { type: "image"; path: string } // ![[path]] ou ![](path) — Publish sobe pro Doc via Drive
   | { type: "code"; text: string; language?: string }
   | { type: "table"; rows: TableCellData[][] } // HTML/GFM com cor de fundo por celula
   | { type: "callout"; title: string; body: string } // caixa 1x1 tipo "Por que IO?" / dica
   | { type: "hr" } // --- sob o titulo → borderBottom no Google Docs
   | { type: "blank" };
+
+type ListKind = "checkbox" | "ordered" | "bullet";
+type DocListKind = ListKind;
 
 const HEADING_NAMED_STYLES = ["HEADING_1", "HEADING_2", "HEADING_3", "HEADING_4", "HEADING_5", "HEADING_6"];
 const MONOSPACE_FONT_FAMILY = "Courier New";
@@ -322,10 +373,23 @@ function parseInlineSpans(line: string): InlineToken[] {
         tokens.push({
           ...inner,
           color: css.color ?? inner.color,
+          highlight: css.highlight ?? inner.highlight,
           fontFamily: css.fontFamily ?? inner.fontFamily,
           fontSizePt: css.fontSizePt ?? inner.fontSizePt,
         });
       }
+      i += m[0].length;
+      continue;
+    }
+
+    // Wiki/MD image FIRST — senao "_" em !_gdocs_media/... vira italico e corrompe o path
+    if ((m = /^!\[\[([^\]]+)\]\]/.exec(rest))) {
+      tokens.push({ text: `![[${m[1]}]]` }); // placeholder; lines with images sao tipicamente bloco "image"
+      i += m[0].length;
+      continue;
+    }
+    if ((m = /^!\[([^\]]*)\]\(([^)]+)\)/.exec(rest))) {
+      tokens.push({ text: m[0] });
       i += m[0].length;
       continue;
     }
@@ -423,8 +487,20 @@ function parseHtmlTable(html: string): TableCellData[][] | null {
       const attrs = cellMatch[1] ?? "";
       const styleAttr = /style="([^"]*)"/i.exec(attrs)?.[1] ?? "";
       const bg = /background-color:\s*(#[0-9a-fA-F]{6})/i.exec(styleAttr)?.[1]?.toLowerCase();
-      const text = cellMatch[2].replace(/<br\s*\/?>/gi, "\n").trim();
-      cells.push({ text, backgroundColor: bg });
+      const borderMatch = /border:\s*([\d.]+)pt\s+solid\s+(#[0-9a-fA-F]{6})/i.exec(styleAttr);
+      let text = cellMatch[2]
+        .replace(/<br\s*\/?>/gi, "\n")
+        .replace(/<strong><em>([\s\S]*?)<\/em><\/strong>/gi, "***$1***")
+        .replace(/<strong>([\s\S]*?)<\/strong>/gi, "**$1**")
+        .replace(/<em>([\s\S]*?)<\/em>/gi, "*$1*")
+        .replace(/<code>([\s\S]*?)<\/code>/gi, "`$1`")
+        .trim();
+      cells.push({
+        text,
+        backgroundColor: bg,
+        borderColor: borderMatch?.[2]?.toLowerCase(),
+        borderWidthPt: borderMatch ? parseFloat(borderMatch[1]) : undefined,
+      });
     }
     if (cells.length > 0) rows.push(cells);
   }
@@ -488,6 +564,10 @@ function buildTextStyleRequestsForTokens(
       fields.push("foregroundColor");
       textStyle.foregroundColor = { color: { rgbColor: hexToRgbColor(token.color) } };
     }
+    if (token.highlight) {
+      fields.push("backgroundColor");
+      textStyle.backgroundColor = { color: { rgbColor: hexToRgbColor(token.highlight) } };
+    }
 
     if (fields.length > 0) {
       requests.push({
@@ -517,11 +597,29 @@ function formatGfmTable(rows: TableCellData[][]): string {
 }
 
 function formatTableMarkdown(rows: TableCellData[][]): string {
-  const hasColors = rows.some((r) => r.some((c) => Boolean(c.backgroundColor)));
-  return hasColors ? formatHtmlTable(rows) : formatGfmTable(rows);
+  const needsHtml = rows.some((r) =>
+    r.some(
+      (c) =>
+        Boolean(c.backgroundColor) ||
+        Boolean(c.borderColor) ||
+        /<\/?[a-z]|(\*\*|__)/i.test(c.text)
+    )
+  );
+  return needsHtml ? formatHtmlTable(rows) : formatGfmTable(rows);
 }
 
-// HTML com background das celulas — Markdown GFM nao aguenta cor de cabecalho/dica do Docs
+/** Markdown inline → HTML pra celulas <td> (Obsidian nao renderiza ** dentro de HTML table). */
+function cellMarkdownToHtml(md: string): string {
+  let s = md.replace(/\n/g, "<br>");
+  // Nao mexe em spans HTML ja existentes; converte so markdown restante
+  s = s.replace(/\*\*\*([^*]+)\*\*\*/g, "<strong><em>$1</em></strong>");
+  s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  s = s.replace(/\*([^*\n]+)\*/g, "<em>$1</em>");
+  s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
+  return s;
+}
+
+// HTML com background/borda das celulas — Markdown GFM nao aguenta estilo do Docs
 function formatHtmlTable(rows: TableCellData[][]): string {
   if (rows.length === 0) return "";
   const colCount = Math.max(...rows.map((r) => r.length), 1);
@@ -531,18 +629,19 @@ function formatHtmlTable(rows: TableCellData[][]): string {
     return padded;
   });
 
-  // Primeira linha com fundo = cabecalho (ex.: rosa #e3115e + texto branco no Doc)
   const firstRowIsHeader = normalized[0].some((c) => Boolean(c.backgroundColor));
 
   const renderCell = (cell: TableCellData, tag: "th" | "td") => {
     const styles: string[] = [];
     if (cell.backgroundColor) styles.push(`background-color:${cell.backgroundColor}`);
-    if (tag === "th") {
+    if (cell.borderColor && (cell.borderWidthPt ?? 0) > 0) {
+      styles.push(`border:${cell.borderWidthPt}pt solid ${cell.borderColor}`);
+    }
+    if (tag === "th" && cell.backgroundColor) {
       styles.push("color:#ffffff", "font-weight:bold");
     }
     const styleAttr = styles.length > 0 ? ` style="${styles.join(";")}"` : "";
-    // Celulas ja vem com spans markdown/HTML do Docs; so troca \n por <br>
-    const content = cell.text.replace(/\n/g, "<br>");
+    const content = cellMarkdownToHtml(cell.text);
     return `<${tag}${styleAttr}>${content}</${tag}>`;
   };
 
@@ -570,6 +669,58 @@ function formatHtmlTable(rows: TableCellData[][]): string {
 function formatCalloutMarkdown(title: string, body: string): string {
   const bodyLines = body.split("\n").map((l) => `> ${l}`);
   return [`> [!tip] ${title}`, ...bodyLines].join("\n");
+}
+
+/** Normaliza caminho de imagem (wiki alias, corrupcao *_*, pastas antigas). */
+function normalizeImagePath(raw: string): string {
+  let path = raw.trim().split("|")[0].trim();
+  path = path.replace(/^\*gdocs\*media\//i, `${GDOCS_MEDIA_FOLDER}/`);
+  path = path.replace(new RegExp(`^${GDOCS_MEDIA_FOLDER_LEGACY}/`, "i"), `${GDOCS_MEDIA_FOLDER}/`);
+  return path.replace(/^\/+/, "");
+}
+
+function extractImagePathFromMarkdown(fragment: string): string | null {
+  const wiki = /^!\[\[([^\]]+)\]\]\s*$/.exec(fragment.trim());
+  if (wiki) return normalizeImagePath(wiki[1]);
+  const md = /^!\[([^\]]*)\]\(([^)]+)\)\s*$/.exec(fragment.trim());
+  if (md) return normalizeImagePath(md[2]);
+  return null;
+}
+
+/**
+ * Quebra uma linha que mistura texto e ![[img]] em blocos separados.
+ * Ex.: "caption ![[a.png]]" → paragraph + image
+ */
+function pushLineWithPossibleImages(
+  blocks: MarkdownBlock[],
+  line: string,
+  spacing?: ParagraphSpacing
+): void {
+  const re = /(!\[[^\]]*\]\([^)]+\)|!\[\[[^\]]+\]\])/g;
+  let last = 0;
+  let match: RegExpExecArray | null;
+  let found = false;
+
+  while ((match = re.exec(line))) {
+    found = true;
+    const before = line.slice(last, match.index).trim();
+    if (before.length > 0) {
+      blocks.push({ type: "paragraph", tokens: parseInlineSpans(before), spacing });
+    }
+    const path = extractImagePathFromMarkdown(match[0]);
+    if (path) blocks.push({ type: "image", path });
+    last = match.index + match[0].length;
+  }
+
+  if (!found) {
+    blocks.push({ type: "paragraph", tokens: parseInlineSpans(line), spacing });
+    return;
+  }
+
+  const after = line.slice(last).trim();
+  if (after.length > 0) {
+    blocks.push({ type: "paragraph", tokens: parseInlineSpans(after), spacing });
+  }
 }
 
 // Quebra o Markdown inteiro em blocos: titulo, lista, paragrafo, bloco de codigo, linha em branco
@@ -660,6 +811,18 @@ function parseMarkdownBlocks(markdown: string): MarkdownBlock[] {
       continue;
     }
 
+    const checkboxMatch = /^[-*]\s+\[([ xX])\]\s+(.*)$/.exec(line);
+    if (checkboxMatch) {
+      blocks.push({
+        type: "checkbox",
+        checked: checkboxMatch[1].toLowerCase() === "x",
+        tokens: parseInlineSpans(checkboxMatch[2]),
+        spacing,
+      });
+      i++;
+      continue;
+    }
+
     const bulletMatch = /^[-*]\s+(.*)$/.exec(line);
     if (bulletMatch) {
       // "- 1. item" / "* 1. item" → lista numerada de verdade, sem o "1." no texto
@@ -684,6 +847,19 @@ function parseMarkdownBlocks(markdown: string): MarkdownBlock[] {
 
     if (line.trim() === "") {
       blocks.push({ type: "blank" });
+      i++;
+      continue;
+    }
+
+    // Imagem sozinha na linha OU texto + imagem na mesma linha
+    const onlyImage = extractImagePathFromMarkdown(line);
+    if (onlyImage) {
+      blocks.push({ type: "image", path: onlyImage });
+      i++;
+      continue;
+    }
+    if (/!\[[^\]]*\]\([^)]+\)|!\[\[[^\]]+\]\]/.test(line)) {
+      pushLineWithPossibleImages(blocks, line, spacing);
       i++;
       continue;
     }
@@ -714,32 +890,40 @@ function buildDocRequestsFromBlocks(
   const textStyleRequests: unknown[] = [];
 
   let bulletRunStart: number | null = null;
-  let bulletRunOrdered = false;
+  let bulletRunKind: ListKind | null = null;
   let lastHeading: { start: number; end: number; color: string | null } | null = null;
 
   const flushBulletRun = (endIndex: number) => {
-    if (bulletRunStart === null) return;
+    if (bulletRunStart === null || bulletRunKind === null) return;
     // endIndex precisa cair no fim do ultimo item (depois do "\n" dele). Se passar para o
     // paragrafo vazio seguinte, o Google cria bullets vazios no fim da lista.
     if (endIndex > bulletRunStart) {
+      const bulletPreset =
+        bulletRunKind === "ordered"
+          ? "NUMBERED_DECIMAL_ALPHA_ROMAN"
+          : bulletRunKind === "checkbox"
+            ? "BULLET_CHECKBOX"
+            : "BULLET_DISC_CIRCLE_SQUARE";
       paragraphStyleRequests.push({
         createParagraphBullets: {
           range: { startIndex: bulletRunStart, endIndex },
-          bulletPreset: bulletRunOrdered ? "NUMBERED_DECIMAL_ALPHA_ROMAN" : "BULLET_DISC_CIRCLE_SQUARE",
+          bulletPreset,
         },
       });
     }
     bulletRunStart = null;
+    bulletRunKind = null;
   };
 
   for (const block of blocks) {
-    // table/callout: insertTable em publishNoteToDoc (API exige re-get entre tabelas)
-    if (block.type === "table" || block.type === "callout") continue;
+    // table/callout/image: publicados a parte em publishNoteToDoc
+    if (block.type === "table" || block.type === "callout" || block.type === "image") continue;
 
-    const isListItem = block.type === "bullet" || block.type === "numbered";
-    const isOrdered = block.type === "numbered";
+    const isListItem = block.type === "bullet" || block.type === "numbered" || block.type === "checkbox";
+    const listKind: ListKind | null =
+      block.type === "numbered" ? "ordered" : block.type === "checkbox" ? "checkbox" : block.type === "bullet" ? "bullet" : null;
 
-    if (bulletRunStart !== null && (!isListItem || isOrdered !== bulletRunOrdered)) {
+    if (bulletRunStart !== null && (!isListItem || listKind !== bulletRunKind)) {
       flushBulletRun(cursor);
     }
 
@@ -836,6 +1020,10 @@ function buildDocRequestsFromBlocks(
         fields.push("foregroundColor");
         textStyle.foregroundColor = { color: { rgbColor: hexToRgbColor(token.color) } };
       }
+      if (token.highlight) {
+        fields.push("backgroundColor");
+        textStyle.backgroundColor = { color: { rgbColor: hexToRgbColor(token.highlight) } };
+      }
 
       if (fields.length > 0 && token.text.length > 0) {
         textStyleRequests.push({
@@ -883,7 +1071,7 @@ function buildDocRequestsFromBlocks(
 
     if (isListItem && bulletRunStart === null) {
       bulletRunStart = paragraphStart;
-      bulletRunOrdered = isOrdered;
+      bulletRunKind = listKind;
     }
   }
 
@@ -955,7 +1143,9 @@ async function runGoogleOAuthFlow(clientId: string, clientSecret: string): Promi
       authUrl.searchParams.set("response_type", "code");
       authUrl.searchParams.set("scope", OAUTH_SCOPE);
       authUrl.searchParams.set("access_type", "offline");
+      // Forca tela de consentimento + escopos novos (Drive) mesmo se ja conectou so Docs antes
       authUrl.searchParams.set("prompt", "consent");
+      authUrl.searchParams.set("include_granted_scopes", "true");
       authUrl.searchParams.set("code_challenge", challenge);
       authUrl.searchParams.set("code_challenge_method", "S256");
       authUrl.searchParams.set("state", state);
@@ -992,6 +1182,7 @@ async function runGoogleOAuthFlow(clientId: string, clientSecret: string): Promi
     access_token?: string;
     refresh_token?: string;
     expires_in?: number;
+    scope?: string;
   };
 
   if (!tokenData.refresh_token || !tokenData.access_token || tokenData.expires_in == null) {
@@ -1000,11 +1191,102 @@ async function runGoogleOAuthFlow(clientId: string, clientSecret: string): Promi
     );
   }
 
+  const scopes = await fetchAccessTokenScopes(tokenData.access_token, tokenData.scope);
+  if (!tokenHasDriveScope(scopes)) {
+    throw new Error(
+      "Login OK no Docs, mas o Google NAO concedeu o escopo Drive. " +
+        "No Google Cloud > Tela de consentimento OAuth, adicione " +
+        "https://www.googleapis.com/auth/drive , ative a Drive API, " +
+        "revogue o app em myaccount.google.com/permissions e conecte de novo."
+    );
+  }
+  if (!tokenHasFullDriveScope(scopes)) {
+    throw new Error(
+      "Drive foi concedido so como drive.file (imagens). " +
+        "Pra organizar Doc+imagens na pasta, adicione o escopo " +
+        "https://www.googleapis.com/auth/drive na Tela de consentimento, " +
+        "revogue o app e conecte de novo."
+    );
+  }
+
   return {
     accessToken: tokenData.access_token,
     refreshToken: tokenData.refresh_token,
     expiresAt: Date.now() + tokenData.expires_in * 1000,
+    grantedScopes: scopes.join(" "),
   };
+}
+
+async function fetchAccessTokenScopes(accessToken: string, fallbackScope?: string): Promise<string[]> {
+  try {
+    const info = await requestUrl({
+      url: `${GOOGLE_TOKENINFO_URL}?access_token=${encodeURIComponent(accessToken)}`,
+      throw: false,
+    });
+    if (info.status >= 200 && info.status < 300) {
+      const scope = (info.json as { scope?: string })?.scope ?? "";
+      if (scope.trim()) return scope.split(/\s+/).filter(Boolean);
+    }
+  } catch (err) {
+    console.error(err);
+  }
+  return (fallbackScope ?? "").split(/\s+/).filter(Boolean);
+}
+
+function tokenHasDriveScope(scopes: string[]): boolean {
+  return scopes.some(
+    (s) =>
+      s === DRIVE_SCOPE ||
+      s === DRIVE_SCOPE_FILE_ONLY ||
+      s === "https://www.googleapis.com/auth/drive.appdata"
+  );
+}
+
+/** Precisa do Drive completo pra mover Docs que o usuario ja tinha. */
+function tokenHasFullDriveScope(scopes: string[]): boolean {
+  return scopes.some((s) => s === DRIVE_SCOPE || s === "https://www.googleapis.com/auth/drive");
+}
+
+async function clearGoogleTokens(plugin: GoogleDocsHubPlugin): Promise<void> {
+  delete plugin.settings.accessToken;
+  delete plugin.settings.refreshToken;
+  delete plugin.settings.accessTokenExpiresAt;
+  delete plugin.settings.grantedScopes;
+  await plugin.saveSettings();
+}
+
+async function ensureDriveScopeOrThrow(plugin: GoogleDocsHubPlugin): Promise<void> {
+  const accessToken = await ensureFreshAccessToken(plugin);
+  const cached = (plugin.settings.grantedScopes ?? "").split(/\s+/).filter(Boolean);
+  if (tokenHasDriveScope(cached)) return;
+
+  const scopes = await fetchAccessTokenScopes(accessToken, plugin.settings.grantedScopes);
+  plugin.settings.grantedScopes = scopes.join(" ");
+  await plugin.saveSettings();
+  if (tokenHasDriveScope(scopes)) return;
+
+  await clearGoogleTokens(plugin);
+  throw new Error(
+    "Sem permissao Drive neste login. Rode Connect Google account de novo e aceite acesso ao Drive. " +
+      "Na Tela de consentimento OAuth do Google Cloud, use o escopo https://www.googleapis.com/auth/drive"
+  );
+}
+
+async function ensureFullDriveScopeOrThrow(plugin: GoogleDocsHubPlugin): Promise<void> {
+  await ensureDriveScopeOrThrow(plugin);
+  const scopes = (plugin.settings.grantedScopes ?? "").split(/\s+/).filter(Boolean);
+  if (tokenHasFullDriveScope(scopes)) return;
+
+  const accessToken = await ensureFreshAccessToken(plugin);
+  const fresh = await fetchAccessTokenScopes(accessToken, plugin.settings.grantedScopes);
+  plugin.settings.grantedScopes = fresh.join(" ");
+  await plugin.saveSettings();
+  if (tokenHasFullDriveScope(fresh)) return;
+
+  throw new Error(
+    "Login tem so drive.file. Pra mover o Doc pra pasta do hub, adicione " +
+      "https://www.googleapis.com/auth/drive na Tela de consentimento, revogue o app e Connect de novo."
+  );
 }
 
 async function ensureFreshAccessToken(plugin: GoogleDocsHubPlugin): Promise<string> {
@@ -1080,11 +1362,145 @@ async function googleApiFetch(
 async function fetchGoogleDoc(plugin: GoogleDocsHubPlugin, docId: string): Promise<any> {
   const response = await googleApiFetch(plugin, `${GOOGLE_DOCS_API_URL}/${docId}?includeTabsContent=true`);
   if (!response.ok) {
-    throw new Error(
+    const err = new Error(
       `Nao foi possivel ler o Doc (HTTP ${response.status}). Confira se o docId esta correto e se voce tem acesso a ele.`
-    );
+    ) as Error & { status?: number };
+    err.status = response.status;
+    throw err;
   }
   return response.json();
+}
+
+/** Doc apagado, na lixeira ou sem acesso: HTTP 404/403. */
+function isDocMissingError(err: unknown): boolean {
+  const status = (err as { status?: number })?.status;
+  if (status === 404 || status === 403) return true;
+  const msg = err instanceof Error ? err.message : String(err);
+  return /HTTP 404|HTTP 403/.test(msg);
+}
+
+async function clearNoteDocLink(plugin: GoogleDocsHubPlugin, file: TFile): Promise<void> {
+  await plugin.app.fileManager.processFrontMatter(file, (fm) => {
+    delete fm[FRONTMATTER_DOC_ID_KEY];
+    delete fm[FRONTMATTER_DOC_URL_KEY];
+    delete fm[FRONTMATTER_DOC_TAB_ID_KEY];
+    delete fm[FRONTMATTER_LAST_SYNCED_REVISION_KEY];
+    delete fm[FRONTMATTER_LAST_SYNCED_HASH_KEY];
+  });
+}
+
+/** Oferece desvincular se o Doc sumiu. Retorna true se tratou (desvinculou ou usuario cancelou). */
+async function offerUnlinkIfDocGone(
+  plugin: GoogleDocsHubPlugin,
+  file: TFile,
+  err: unknown
+): Promise<boolean> {
+  if (!isDocMissingError(err)) return false;
+
+  return new Promise((resolve) => {
+    new UnlinkMissingDocModal(plugin.app, file.basename, async (doUnlink) => {
+      if (doUnlink) {
+        await clearNoteDocLink(plugin, file);
+        plugin.refreshUi();
+        new Notice("Nota desvinculada. O Doc não existe mais (apagado ou na lixeira).");
+      }
+      resolve(true);
+    }).open();
+  });
+}
+
+class UnlinkMissingDocModal extends Modal {
+  private noteName: string;
+  private onChoose: (unlink: boolean) => void;
+
+  constructor(app: App, noteName: string, onChoose: (unlink: boolean) => void) {
+    super(app);
+    this.noteName = noteName;
+    this.onChoose = onChoose;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    new Setting(contentEl).setName("Google Doc não encontrado").setHeading();
+    contentEl.createEl("p", {
+      text:
+        `A nota "${this.noteName}" ainda aponta pra um Doc, mas o Google respondeu que ele ` +
+        `não existe ou está inacessível (apagado / lixeira / sem permissão).`,
+    });
+    contentEl.createEl("p", {
+      text: "Desvincular esta nota agora? (remove google_doc_id e afins do frontmatter)",
+    });
+
+    contentEl
+      .createEl("button", {
+        text: "Sim, desvincular",
+        cls: "mod-cta gdocs-hub-block-button-spaced",
+      })
+      .addEventListener("click", () => {
+        this.close();
+        this.onChoose(true);
+      });
+
+    contentEl
+      .createEl("button", {
+        text: "Não, manter o vínculo",
+        cls: "gdocs-hub-block-button",
+      })
+      .addEventListener("click", () => {
+        this.close();
+        this.onChoose(false);
+      });
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
+/** Confirmação do botão Desvincular na barra da nota. */
+class ConfirmUnlinkModal extends Modal {
+  private noteName: string;
+  private onChoose: (ok: boolean) => void;
+
+  constructor(app: App, noteName: string, onChoose: (ok: boolean) => void) {
+    super(app);
+    this.noteName = noteName;
+    this.onChoose = onChoose;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    new Setting(contentEl).setName("Desvincular Google Doc").setHeading();
+    contentEl.createEl("p", {
+      text:
+        `Remover o vínculo da nota "${this.noteName}"? O Doc no Google não será apagado. ` +
+        `Só saem as propriedades google_doc_* desta nota.`,
+    });
+
+    contentEl
+      .createEl("button", {
+        text: "Sim, desvincular",
+        cls: "mod-cta gdocs-hub-block-button-spaced",
+      })
+      .addEventListener("click", () => {
+        this.close();
+        this.onChoose(true);
+      });
+
+    contentEl
+      .createEl("button", {
+        text: "Cancelar",
+        cls: "gdocs-hub-block-button",
+      })
+      .addEventListener("click", () => {
+        this.close();
+        this.onChoose(false);
+      });
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
 }
 
 // Achata a arvore de guias (uma guia pode ter sub-guias) numa lista simples, na ordem que aparecem
@@ -1105,17 +1521,30 @@ function listDocTabs(doc: any): Array<{ tabId: string; title: string }> {
 }
 
 // Devolve o "corpo" da guia certa (ou a primeira, se a nota ainda nao tem guia salva/documento sem guias),
-// no mesmo formato { body, lists, namedRanges } que o resto do codigo ja sabe ler
-function resolveDocForTab(doc: any, tabId?: string): { body: any; lists: any; namedRanges: any } {
+// no mesmo formato { body, lists, namedRanges, inlineObjects } que o resto do codigo ja sabe ler
+function resolveDocForTab(
+  doc: any,
+  tabId?: string
+): { body: any; lists: any; namedRanges: any; inlineObjects: Record<string, any> } {
   const flatTabs = flattenDocTabs(doc.tabs);
 
   if (flatTabs.length === 0) {
-    return { body: doc.body, lists: doc.lists, namedRanges: doc.namedRanges };
+    return {
+      body: doc.body,
+      lists: doc.lists,
+      namedRanges: doc.namedRanges,
+      inlineObjects: doc.inlineObjects ?? {},
+    };
   }
 
   const target = (tabId && flatTabs.find((tab) => tab.tabProperties?.tabId === tabId)) || flatTabs[0];
   const documentTab = target.documentTab ?? {};
-  return { body: documentTab.body, lists: documentTab.lists, namedRanges: documentTab.namedRanges };
+  return {
+    body: documentTab.body,
+    lists: documentTab.lists,
+    namedRanges: documentTab.namedRanges,
+    inlineObjects: documentTab.inlineObjects ?? {},
+  };
 }
 
 // Carimba tabId em todo range/location dos requests, senao o Google aplica na primeira guia por padrao.
@@ -1191,12 +1620,28 @@ function getParagraphBorderBottomColor(paragraph: any): string | null {
   return rgb ? rgbColorToHex(rgb) : "#000000";
 }
 
-// Reconstroi a linha em Markdown, aplicando negrito/italico/fonte/tamanho/cor/link por trecho (textRun)
-function renderParagraphMarkdown(paragraph: any): string {
+// Reconstroi a linha em Markdown, aplicando negrito/italico/fonte/tamanho/cor/link por trecho (textRun).
+// Inline images ja baixadas entram como ![](caminho) — markdown puro NAO cria aresta no grafo
+// (estrela fica no gdocs-media_Mapa via [[img]]; ![[wiki]] geraria floco de neve).
+function renderParagraphMarkdown(
+  paragraph: any,
+  imagePaths?: Map<string, string>
+): string {
   const elements = paragraph.elements ?? [];
   let markdown = "";
 
   for (const element of elements) {
+    const inlineObjectId = element.inlineObjectElement?.inlineObjectId as string | undefined;
+    if (inlineObjectId) {
+      const vaultPath = imagePaths?.get(inlineObjectId);
+      if (vaultPath) {
+        if (markdown.length > 0 && !markdown.endsWith("\n")) markdown += "\n\n";
+        markdown += `![](${vaultPath})`;
+        if (!markdown.endsWith("\n")) markdown += "\n";
+      }
+      continue;
+    }
+
     const run = element.textRun;
     if (!run) continue;
 
@@ -1229,9 +1674,12 @@ function renderParagraphMarkdown(paragraph: any): string {
 
     const rgbColor = style.foregroundColor?.color?.rgbColor;
     const color = rgbColor ? rgbColorToHex(rgbColor) : undefined;
-    // Preserva Calibri/tamanho do Doc no Markdown (senao o Publish joga pra Arial padrao do Heading)
+    const highlightRgb = style.backgroundColor?.color?.rgbColor;
+    const highlight = highlightRgb ? rgbColorToHex(highlightRgb) : undefined;
+    // Preserva Calibri/tamanho/marca-texto do Doc no Markdown
     piece = wrapWithStyleSpan(piece, {
       color,
+      highlight,
       fontFamily: !isMonospace && fontFamily ? fontFamily : undefined,
       fontSizePt,
     });
@@ -1239,11 +1687,108 @@ function renderParagraphMarkdown(paragraph: any): string {
     markdown += piece;
   }
 
-  return markdown;
+  return markdown.trimEnd();
 }
 
-// Consulta a lista global do Doc pra saber se esse item e numerado ou so com marcador.
-// Listas numeradas usam glyphType (DECIMAL, ALPHA, ROMAN...); listas com bullet usam glyphSymbol.
+function paragraphHasInlineImage(paragraph: any): boolean {
+  return (paragraph.elements ?? []).some((el: any) => el.inlineObjectElement?.inlineObjectId);
+}
+
+function collectInlineObjectIds(bodyContent: any[]): string[] {
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  for (const element of bodyContent) {
+    const paragraph = element.paragraph;
+    if (!paragraph) continue;
+    for (const pe of paragraph.elements ?? []) {
+      const id = pe.inlineObjectElement?.inlineObjectId as string | undefined;
+      if (id && !seen.has(id)) {
+        seen.add(id);
+        ids.push(id);
+      }
+    }
+  }
+  return ids;
+}
+
+function extensionFromContentType(contentType: string | undefined): string {
+  const ct = (contentType ?? "").split(";")[0].trim().toLowerCase();
+  if (ct === "image/jpeg" || ct === "image/jpg") return "jpg";
+  if (ct === "image/gif") return "gif";
+  if (ct === "image/webp") return "webp";
+  if (ct === "image/svg+xml") return "svg";
+  return "png";
+}
+
+function sanitizeMediaFileName(objectId: string): string {
+  return objectId.replace(/[^a-zA-Z0-9._-]+/g, "_");
+}
+
+async function ensureVaultFolder(plugin: GoogleDocsHubPlugin, folderPath: string): Promise<void> {
+  const parts = folderPath.replace(/\/+$/, "").split("/").filter(Boolean);
+  let current = "";
+  for (const part of parts) {
+    current = current ? `${current}/${part}` : part;
+    if (!plugin.app.vault.getAbstractFileByPath(current)) {
+      await plugin.app.vault.createFolder(current);
+    }
+  }
+}
+
+// Baixa imagens embutidas do Doc (contentUri temporario do Google) pra pasta do vault.
+async function downloadDocImagesToVault(
+  plugin: GoogleDocsHubPlugin,
+  inlineObjects: Record<string, any>,
+  objectIds: string[],
+  folderPath: string
+): Promise<Map<string, string>> {
+  const result = new Map<string, string>();
+  if (objectIds.length === 0) return result;
+
+  const normalizedFolder = folderPath.replace(/\/+$/, "");
+  if (normalizedFolder) {
+    await ensureVaultFolder(plugin, normalizedFolder);
+  }
+
+  for (const objectId of objectIds) {
+    const emb = inlineObjects[objectId]?.inlineObjectProperties?.embeddedObject;
+    const contentUri: string | undefined =
+      emb?.imageProperties?.contentUri || emb?.imageProperties?.sourceUri;
+    if (!contentUri) continue;
+
+    try {
+      const response = await requestUrl({ url: contentUri, method: "GET", throw: false });
+      if (response.status < 200 || response.status >= 300) {
+        console.error(`Falha ao baixar imagem ${objectId}: HTTP ${response.status}`);
+        continue;
+      }
+
+      const ext = extensionFromContentType(
+        response.headers?.["content-type"] ?? response.headers?.["Content-Type"]
+      );
+      const fileName = `${sanitizeMediaFileName(objectId)}.${ext}`;
+      const vaultPath = normalizedFolder ? `${normalizedFolder}/${fileName}` : fileName;
+      const data = response.arrayBuffer;
+
+      const existing = plugin.app.vault.getAbstractFileByPath(vaultPath);
+      if (existing instanceof TFile) {
+        await plugin.app.vault.modifyBinary(existing, data);
+      } else {
+        await plugin.app.vault.createBinary(vaultPath, data);
+      }
+      result.set(objectId, vaultPath);
+    } catch (err) {
+      console.error(`Falha ao baixar imagem ${objectId}:`, err);
+    }
+  }
+
+  return result;
+}
+
+// Classifica lista do Google Docs:
+// - checkbox: glyphType UNSPECIFIED sem glyphSymbol (lista de tarefas)
+// - ordered: DECIMAL/ALPHA/ROMAN... ou glyphFormat tipo "%0."
+// - bullet: tem glyphSymbol (●, ○...) — NAO usar /%\d/ solto no glyphFormat (bullets tambem tem "%0")
 const ORDERED_GLYPH_TYPES = new Set([
   "DECIMAL",
   "ZERO_DECIMAL",
@@ -1253,18 +1798,36 @@ const ORDERED_GLYPH_TYPES = new Set([
   "ROMAN",
 ]);
 
-function isOrderedListItem(doc: any, listId: string, nestingLevel: number): boolean {
+function classifyListKind(doc: any, listId: string, nestingLevel: number): DocListKind {
   const level = doc.lists?.[listId]?.listProperties?.nestingLevels?.[nestingLevel];
-  if (!level) return false;
-  if (ORDERED_GLYPH_TYPES.has(level.glyphType)) return true;
-  // Alguns Docs so trazem glyphFormat ("%0.") sem glyphType preenchido
-  return typeof level.glyphFormat === "string" && /%\d/.test(level.glyphFormat);
+  if (!level) return "bullet";
+
+  // Marcador visual (bolinha etc.) = lista nao numerada
+  if (typeof level.glyphSymbol === "string" && level.glyphSymbol.length > 0) {
+    return "bullet";
+  }
+
+  if (ORDERED_GLYPH_TYPES.has(level.glyphType)) {
+    return "ordered";
+  }
+
+  // Checklist do Google Docs: GLYPH_TYPE_UNSPECIFIED + sem glyphSymbol
+  if (level.glyphType === "GLYPH_TYPE_UNSPECIFIED") {
+    return "checkbox";
+  }
+
+  // So trata como numerada se o formato parecer "1." / "1)" — "%0" sozinho NAO basta
+  if (typeof level.glyphFormat === "string" && /%\d[.)]/.test(level.glyphFormat)) {
+    return "ordered";
+  }
+
+  return "bullet";
 }
 
 type DocToken =
   | { kind: "code"; text: string; startIndex?: number; language?: string }
   | { kind: "empty" }
-  | { kind: "bullet"; ordered: boolean; text: string; spacing?: ParagraphSpacing }
+  | { kind: "bullet"; listKind: DocListKind; text: string; spacing?: ParagraphSpacing }
   | { kind: "heading"; level: number; text: string; borderBottomColor?: string; spacing?: ParagraphSpacing }
   | { kind: "paragraph"; text: string; spacing?: ParagraphSpacing }
   | { kind: "table"; rows: TableCellData[][] }
@@ -1298,6 +1861,44 @@ function getTableCellBackgroundHex(cell: any): string | undefined {
   const b = rgb.blue ?? 0;
   if (r > 0.97 && g > 0.97 && b > 0.97) return undefined;
   return rgbColorToHex(rgb);
+}
+
+/** Pega a borda mais “forte” da celula (grossa ou colorida — nao a fina padrao ~0.5pt preta). */
+function getTableCellAccentBorder(
+  cell: any
+): { color: string; widthPt: number } | undefined {
+  const style = cell.tableCellStyle ?? {};
+  const sides = [style.borderTop, style.borderBottom, style.borderLeft, style.borderRight];
+  let best: { color: string; widthPt: number } | undefined;
+  for (const border of sides) {
+    if (!border) continue;
+    const widthPt = border.width?.magnitude ?? 0;
+    if (widthPt <= 0) continue;
+    const rgb = border.color?.color?.rgbColor;
+    const color = rgb ? rgbColorToHex(rgb) : "#000000";
+    const isDefaultBlackThin = widthPt <= 0.75 && color === "#000000";
+    if (isDefaultBlackThin) continue;
+    if (!best || widthPt > best.widthPt) best = { color, widthPt };
+  }
+  return best;
+}
+
+function extractTableRows(table: any): TableCellData[][] {
+  const rows: TableCellData[][] = [];
+  for (const row of table.tableRows ?? []) {
+    const cells: TableCellData[] = [];
+    for (const cell of row.tableCells ?? []) {
+      const border = getTableCellAccentBorder(cell);
+      cells.push({
+        text: getTableCellMarkdown(cell),
+        backgroundColor: getTableCellBackgroundHex(cell),
+        borderColor: border?.color,
+        borderWidthPt: border?.widthPt,
+      });
+    }
+    rows.push(cells);
+  }
+  return rows;
 }
 
 function cellLooksLikeCode(cell: any): boolean {
@@ -1349,21 +1950,6 @@ function guessCodeLanguage(text: string): string | undefined {
   return undefined;
 }
 
-function extractTableRows(table: any): TableCellData[][] {
-  const rows: TableCellData[][] = [];
-  for (const row of table.tableRows ?? []) {
-    const cells: TableCellData[] = [];
-    for (const cell of row.tableCells ?? []) {
-      cells.push({
-        text: getTableCellMarkdown(cell),
-        backgroundColor: getTableCellBackgroundHex(cell),
-      });
-    }
-    rows.push(cells);
-  }
-  return rows;
-}
-
 function splitCalloutTitleAndBody(plain: string): { title: string; body: string } {
   const lines = plain.split("\n");
   const title = (lines[0] ?? "").trim() || "Nota";
@@ -1401,7 +1987,7 @@ function findCodeLanguage(
 }
 
 // Percorre o body do Doc (paragrafos E tabelas) e classifica cada elemento
-function tokenizeDocParagraphs(doc: any): DocToken[] {
+function tokenizeDocParagraphs(doc: any, imagePaths?: Map<string, string>): DocToken[] {
   const bodyContent = doc.body?.content ?? [];
   const tokens: DocToken[] = [];
 
@@ -1434,13 +2020,14 @@ function tokenizeDocParagraphs(doc: any): DocToken[] {
     const namedStyle = paragraph.paragraphStyle?.namedStyleType ?? "NORMAL_TEXT";
     const bullet = paragraph.bullet;
     const headingLevel = HEADING_NAMED_STYLES.indexOf(namedStyle) + 1;
+    const hasImage = paragraphHasInlineImage(paragraph);
 
-    if (plainText.trim().length === 0 && !bullet) {
+    if (plainText.trim().length === 0 && !bullet && !hasImage) {
       tokens.push({ kind: "empty" });
       continue;
     }
 
-    if (!bullet && namedStyle === "NORMAL_TEXT" && isWholeLineMonospace(paragraph)) {
+    if (!bullet && namedStyle === "NORMAL_TEXT" && isWholeLineMonospace(paragraph) && !hasImage) {
       tokens.push({ kind: "code", text: plainText, startIndex: element.startIndex });
       continue;
     }
@@ -1454,7 +2041,7 @@ function tokenizeDocParagraphs(doc: any): DocToken[] {
       tokens.push({
         kind: "heading",
         level: headingLevel,
-        text: renderParagraphMarkdown(paragraph),
+        text: renderParagraphMarkdown(paragraph, imagePaths),
         borderBottomColor,
         spacing,
       });
@@ -1462,12 +2049,17 @@ function tokenizeDocParagraphs(doc: any): DocToken[] {
     }
 
     if (bullet) {
-      const ordered = isOrderedListItem(doc, bullet.listId, bullet.nestingLevel ?? 0);
-      tokens.push({ kind: "bullet", ordered, text: renderParagraphMarkdown(paragraph), spacing });
+      const listKind = classifyListKind(doc, bullet.listId, bullet.nestingLevel ?? 0);
+      tokens.push({
+        kind: "bullet",
+        listKind,
+        text: renderParagraphMarkdown(paragraph, imagePaths),
+        spacing,
+      });
       continue;
     }
 
-    tokens.push({ kind: "paragraph", text: renderParagraphMarkdown(paragraph), spacing });
+    tokens.push({ kind: "paragraph", text: renderParagraphMarkdown(paragraph, imagePaths), spacing });
   }
 
   return tokens;
@@ -1494,10 +2086,32 @@ function reclassifyBlankLinesInsideCode(tokens: DocToken[]): void {
   }
 }
 
-// Percorre os paragrafos do Doc e reconstroi o Markdown: titulos, listas, bloco de codigo, texto normal
-function convertDocToMarkdown(doc: any, tabId?: string): string {
+/** Pasta de midia ao lado da nota: `PastaDaNota/gdocs-media/` (nao na raiz do vault). */
+function mediaFolderForNote(file: TFile): string {
+  const slash = file.path.lastIndexOf("/");
+  if (slash > 0) {
+    return `${file.path.slice(0, slash)}/${GDOCS_MEDIA_FOLDER}`;
+  }
+  return GDOCS_MEDIA_FOLDER;
+}
+
+// Percorre os paragrafos do Doc e reconstroi o Markdown: titulos, listas, bloco de codigo, texto, imagens
+async function convertDocToMarkdown(
+  plugin: GoogleDocsHubPlugin,
+  doc: any,
+  tabId?: string,
+  docId?: string,
+  noteFile?: TFile,
+  mediaFolderOverride?: string
+): Promise<string> {
   const resolved = resolveDocForTab(doc, tabId);
-  const tokens = tokenizeDocParagraphs(resolved);
+  const objectIds = collectInlineObjectIds(resolved.body?.content ?? []);
+  const mediaFolder =
+    mediaFolderOverride ??
+    (noteFile ? mediaFolderForNote(noteFile) : GDOCS_MEDIA_FOLDER);
+  const imagePaths = await downloadDocImagesToVault(plugin, resolved.inlineObjects, objectIds, mediaFolder);
+
+  const tokens = tokenizeDocParagraphs(resolved, imagePaths);
   reclassifyBlankLinesInsideCode(tokens);
   const languageRanges = buildCodeLanguageRanges(resolved);
 
@@ -1545,10 +2159,11 @@ function convertDocToMarkdown(doc: any, tabId?: string): string {
     if (token.kind === "bullet") {
       // Sempre tira "1. " do texto — senao vira "1. 1. item" quando a lista ja e numerada
       let itemText = token.text;
-      let ordered = token.ordered;
+      let listKind = token.listKind;
       const stripped = stripLeadingManualNumber(itemText);
       if (stripped.ordered) {
-        ordered = true;
+        // Prefixo literal "1." no texto so forca numerada se nao for checkbox
+        if (listKind !== "checkbox") listKind = "ordered";
         itemText = stripped.content;
       }
 
@@ -1559,9 +2174,12 @@ function convertDocToMarkdown(doc: any, tabId?: string): string {
         lineSpacing: token.spacing?.lineSpacing ?? DEFAULT_LIST_SPACING.lineSpacing,
       };
       const spacingComment = formatSpacingComment(spacingForMarkdownExport(listSpacing) ?? {});
-      if (ordered) {
+      if (listKind === "ordered") {
         orderedCounter += 1;
         lines.push(`${orderedCounter}. ${itemText}${spacingComment}`);
+      } else if (listKind === "checkbox") {
+        orderedCounter = 0;
+        lines.push(`- [ ] ${itemText}${spacingComment}`);
       } else {
         orderedCounter = 0;
         lines.push(`- ${itemText}${spacingComment}`);
@@ -1605,8 +2223,8 @@ async function docsBatchUpdate(
   docId: string,
   requests: unknown[],
   tabId?: string
-): Promise<void> {
-  if (requests.length === 0) return;
+): Promise<any> {
+  if (requests.length === 0) return {};
   const updateResponse = await googleApiFetch(plugin, `${GOOGLE_DOCS_API_URL}/${docId}:batchUpdate`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1616,6 +2234,7 @@ async function docsBatchUpdate(
     const errorBody = await updateResponse.text();
     throw new Error(`Falha ao atualizar o Doc (HTTP ${updateResponse.status}): ${errorBody}`);
   }
+  return updateResponse.json();
 }
 
 function getDocBodyEndIndex(doc: any, tabId?: string): number {
@@ -1709,6 +2328,430 @@ async function appendBlocksToDoc(
 const CALLOUT_CELL_BG = "#fdf0f5"; // rosa claro tipico das caixas "Dica" / "Por que IO?"
 const CODE_CELL_BG = "#f2f2f2"; // caixa cinza de codigo no Docs
 
+function mimeFromExtension(ext: string): string {
+  const e = ext.toLowerCase().replace(/^\./, "");
+  if (e === "jpg" || e === "jpeg") return "image/jpeg";
+  if (e === "gif") return "image/gif";
+  if (e === "webp") return "image/webp";
+  if (e === "svg") return "image/svg+xml";
+  return "image/png";
+}
+
+function sanitizeDriveFolderName(name: string): string {
+  return name.replace(/[\\/:*?"<>|]/g, " ").replace(/\s+/g, " ").trim().slice(0, 100) || "Sem titulo";
+}
+
+async function driveJsonRequest(
+  plugin: GoogleDocsHubPlugin,
+  url: string,
+  options: { method?: string; body?: string } = {}
+): Promise<{ ok: boolean; status: number; json: any }> {
+  const accessToken = await ensureFreshAccessToken(plugin);
+  const response = await requestUrl({
+    url,
+    method: options.method ?? "GET",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      ...(options.body ? { "Content-Type": "application/json" } : {}),
+    },
+    body: options.body,
+    throw: false,
+  });
+  return {
+    ok: response.status >= 200 && response.status < 300,
+    status: response.status,
+    json: response.json,
+  };
+}
+
+async function findDriveChildFolder(
+  plugin: GoogleDocsHubPlugin,
+  name: string,
+  parentId: string
+): Promise<string | null> {
+  const escaped = name.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const q =
+    `name='${escaped}' and mimeType='application/vnd.google-apps.folder' and trashed=false and '${parentId}' in parents`;
+  const url =
+    `${GOOGLE_DRIVE_API_URL}?q=${encodeURIComponent(q)}&fields=files(id,name)&pageSize=10&spaces=drive`;
+  const res = await driveJsonRequest(plugin, url);
+  if (!res.ok) return null;
+  const files = (res.json?.files ?? []) as Array<{ id?: string }>;
+  return files[0]?.id ?? null;
+}
+
+async function createDriveFolder(
+  plugin: GoogleDocsHubPlugin,
+  name: string,
+  parentId?: string
+): Promise<string> {
+  const metadata: Record<string, unknown> = {
+    name,
+    mimeType: "application/vnd.google-apps.folder",
+  };
+  if (parentId) metadata.parents = [parentId];
+
+  const res = await driveJsonRequest(plugin, GOOGLE_DRIVE_API_URL, {
+    method: "POST",
+    body: JSON.stringify(metadata),
+  });
+  if (!res.ok || !res.json?.id) {
+    throw new Error(`Falha ao criar pasta no Drive "${name}" (HTTP ${res.status}).`);
+  }
+  return res.json.id as string;
+}
+
+async function findOrCreateDriveFolder(
+  plugin: GoogleDocsHubPlugin,
+  name: string,
+  parentId: string
+): Promise<string> {
+  const existing = await findDriveChildFolder(plugin, name, parentId);
+  if (existing) return existing;
+  return createDriveFolder(plugin, name, parentId);
+}
+
+/** Meu Drive / Google Docs Hub / {tituloDoDoc}/ */
+async function ensureDocDriveFolder(plugin: GoogleDocsHubPlugin, docTitle: string): Promise<string> {
+  await ensureDriveScopeOrThrow(plugin);
+  const hubId = await findOrCreateDriveFolder(plugin, DRIVE_HUB_ROOT_FOLDER_NAME, "root");
+  return findOrCreateDriveFolder(plugin, sanitizeDriveFolderName(docTitle), hubId);
+}
+
+/** Move o Doc pra pasta do hub (exige escopo Drive completo). */
+async function tryMoveDriveFileToFolder(
+  plugin: GoogleDocsHubPlugin,
+  fileId: string,
+  folderId: string
+): Promise<{ ok: boolean; alreadyThere: boolean; status?: number }> {
+  const meta = await driveJsonRequest(plugin, `${GOOGLE_DRIVE_API_URL}/${fileId}?fields=parents`);
+  if (!meta.ok) {
+    console.warn(`[Google Docs Hub] Nao leu parents do Doc (HTTP ${meta.status}).`, meta.json);
+    return { ok: false, alreadyThere: false, status: meta.status };
+  }
+
+  const parents: string[] = Array.isArray(meta.json?.parents) ? meta.json.parents : [];
+  if (parents.includes(folderId)) return { ok: true, alreadyThere: true };
+
+  const removeParents = parents.length > 0 ? parents.join(",") : "root";
+  const url =
+    `${GOOGLE_DRIVE_API_URL}/${fileId}?addParents=${encodeURIComponent(folderId)}` +
+    `&removeParents=${encodeURIComponent(removeParents)}&fields=id,parents`;
+  const moved = await driveJsonRequest(plugin, url, { method: "PATCH", body: "{}" });
+  if (!moved.ok) {
+    console.warn(`[Google Docs Hub] Falha ao mover Doc (HTTP ${moved.status}).`, moved.json);
+  }
+  return { ok: moved.ok, alreadyThere: false, status: moved.status };
+}
+
+function resolveVaultImageFile(plugin: GoogleDocsHubPlugin, path: string): TFile | null {
+  const candidates = [
+    path,
+    path.replace(new RegExp(`^${GDOCS_MEDIA_FOLDER}/`), `${GDOCS_MEDIA_FOLDER_LEGACY}/`),
+    path.replace(new RegExp(`^${GDOCS_MEDIA_FOLDER_LEGACY}/`), `${GDOCS_MEDIA_FOLDER}/`),
+  ];
+  for (const candidate of candidates) {
+    const file = plugin.app.vault.getAbstractFileByPath(candidate);
+    if (file instanceof TFile) return file;
+  }
+  // Busca pelo nome do arquivo se o path relativo falhar (pasta da nota ou raiz legado)
+  const base = path.split("/").pop();
+  if (base) {
+    const match = plugin.app.vault
+      .getFiles()
+      .find(
+        (f) =>
+          f.name === base &&
+          (f.path.includes(`/${GDOCS_MEDIA_FOLDER}/`) ||
+            f.path.startsWith(`${GDOCS_MEDIA_FOLDER}/`) ||
+            f.path.includes(`/${GDOCS_MEDIA_FOLDER_LEGACY}/`) ||
+            f.path.startsWith(`${GDOCS_MEDIA_FOLDER_LEGACY}/`))
+      );
+    if (match) return match;
+  }
+  return null;
+}
+
+async function sha256Hex(data: ArrayBuffer): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function drivePublicImageUrl(fileId: string): string {
+  return `https://drive.google.com/uc?export=download&id=${fileId}`;
+}
+
+async function findDriveChildFileByName(
+  plugin: GoogleDocsHubPlugin,
+  name: string,
+  parentId: string
+): Promise<string | null> {
+  const escaped = name.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const q =
+    `name='${escaped}' and trashed=false and '${parentId}' in parents ` +
+    `and mimeType!='application/vnd.google-apps.folder'`;
+  const url =
+    `${GOOGLE_DRIVE_API_URL}?q=${encodeURIComponent(q)}&fields=files(id,name)&pageSize=5&spaces=drive`;
+  const res = await driveJsonRequest(plugin, url);
+  if (!res.ok) return null;
+  const files = (res.json?.files ?? []) as Array<{ id?: string }>;
+  return files[0]?.id ?? null;
+}
+
+/** MD5 local (Node/Electron) pra casar com md5Checksum do Drive — reaproveita PNG even com nome kix.* novo. */
+function md5Hex(data: ArrayBuffer): string | null {
+  try {
+    // Obsidian desktop: Node crypto disponivel
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { createHash } = require("crypto") as typeof import("crypto");
+    return createHash("md5").update(Buffer.from(data)).digest("hex");
+  } catch {
+    return null;
+  }
+}
+
+async function findDriveFileInFolderByMd5(
+  plugin: GoogleDocsHubPlugin,
+  folderId: string,
+  md5: string
+): Promise<string | null> {
+  const q = `trashed=false and '${folderId}' in parents and mimeType contains 'image/'`;
+  const url =
+    `${GOOGLE_DRIVE_API_URL}?q=${encodeURIComponent(q)}` +
+    `&fields=files(id,md5Checksum,name)&pageSize=100&spaces=drive`;
+  const res = await driveJsonRequest(plugin, url);
+  if (!res.ok) return null;
+  const files = (res.json?.files ?? []) as Array<{ id?: string; md5Checksum?: string }>;
+  const hit = files.find((f) => (f.md5Checksum ?? "").toLowerCase() === md5.toLowerCase());
+  return hit?.id ?? null;
+}
+
+async function ensureDriveFileAnyoneReadable(
+  plugin: GoogleDocsHubPlugin,
+  fileId: string,
+  accessToken: string
+): Promise<void> {
+  const perm = await requestUrl({
+    url: `${GOOGLE_DRIVE_API_URL}/${fileId}/permissions`,
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ role: "reader", type: "anyone" }),
+    throw: false,
+  });
+  // 400/409: ja public — ok
+  if (perm.status >= 200 && perm.status < 300) return;
+  if (perm.status === 400 || perm.status === 409) return;
+  throw new Error(
+    `Falha ao tornar a imagem publica no Drive (HTTP ${perm.status}). Sem isso o Docs nao consegue buscar a imagem.`
+  );
+}
+
+async function updateDriveFileMedia(
+  plugin: GoogleDocsHubPlugin,
+  fileId: string,
+  bytes: ArrayBuffer,
+  mime: string,
+  accessToken: string
+): Promise<void> {
+  const res = await requestUrl({
+    url: `${GOOGLE_DRIVE_UPLOAD_API_URL}/${fileId}?uploadType=media`,
+    method: "PATCH",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": mime,
+    },
+    body: bytes,
+    throw: false,
+  });
+  if (res.status < 200 || res.status >= 300) {
+    throw new Error(`Falha ao atualizar imagem no Drive (HTTP ${res.status}).`);
+  }
+}
+
+async function rememberDriveImageHash(
+  plugin: GoogleDocsHubPlugin,
+  hash: string,
+  driveId: string
+): Promise<void> {
+  if (!plugin.settings.driveImageCache) plugin.settings.driveImageCache = {};
+  plugin.settings.driveImageCache[hash] = driveId;
+  await plugin.saveSettings();
+}
+
+/** Sobe a imagem pro Drive (na pasta do Doc), reutiliza se o conteudo ja foi enviado, torna publica. */
+async function uploadImageToDriveForDocs(
+  plugin: GoogleDocsHubPlugin,
+  file: TFile,
+  folderId?: string,
+  sessionCache?: Map<string, string>
+): Promise<string> {
+  await ensureDriveScopeOrThrow(plugin);
+  const accessToken = await ensureFreshAccessToken(plugin);
+  const bytes = await plugin.app.vault.readBinary(file);
+  const mime = mimeFromExtension(file.extension);
+  const hash = await sha256Hex(bytes);
+
+  if (sessionCache?.has(hash)) {
+    return sessionCache.get(hash) as string;
+  }
+
+  const finish = async (driveId: string): Promise<string> => {
+    await ensureDriveFileAnyoneReadable(plugin, driveId, accessToken);
+    await rememberDriveImageHash(plugin, hash, driveId);
+    const url = drivePublicImageUrl(driveId);
+    sessionCache?.set(hash, url);
+    return url;
+  };
+
+  // 1) Cache por conteudo (Publish anterior)
+  const cachedId = plugin.settings.driveImageCache?.[hash];
+  if (cachedId) {
+    const check = await driveJsonRequest(
+      plugin,
+      `${GOOGLE_DRIVE_API_URL}/${cachedId}?fields=id,trashed`
+    );
+    if (check.ok && check.json?.trashed !== true) {
+      return finish(cachedId);
+    }
+  }
+
+  // 2) Mesmo conteudo ja na pasta (md5) — cobre Sync que gera novo nome kix.*
+  if (folderId) {
+    const md5 = md5Hex(bytes);
+    if (md5) {
+      const byMd5 = await findDriveFileInFolderByMd5(plugin, folderId, md5);
+      if (byMd5) return finish(byMd5);
+    }
+  }
+
+  // 3) Mesmo nome ja na pasta do Doc → atualiza midia, nao cria arquivo novo
+  if (folderId) {
+    const existingId = await findDriveChildFileByName(plugin, file.name, folderId);
+    if (existingId) {
+      try {
+        await updateDriveFileMedia(plugin, existingId, bytes, mime, accessToken);
+      } catch (err) {
+        console.warn("[Google Docs Hub] Update de midia falhou; reutiliza arquivo existente.", err);
+      }
+      return finish(existingId);
+    }
+  }
+
+  // 4) Upload novo
+  const metadataObj: Record<string, unknown> = { name: file.name, mimeType: mime };
+  if (folderId) metadataObj.parents = [folderId];
+  const metadata = JSON.stringify(metadataObj);
+  const boundary = "gdocs_hub_" + Date.now().toString(36);
+  const metaPart =
+    `--${boundary}\r\n` +
+    `Content-Type: application/json; charset=UTF-8\r\n\r\n` +
+    `${metadata}\r\n`;
+  const binHeader =
+    `--${boundary}\r\n` +
+    `Content-Type: ${mime}\r\n\r\n`;
+  const footer = `\r\n--${boundary}--`;
+
+  const metaBytes = new TextEncoder().encode(metaPart);
+  const headerBytes = new TextEncoder().encode(binHeader);
+  const footerBytes = new TextEncoder().encode(footer);
+  const body = new Uint8Array(metaBytes.length + headerBytes.length + bytes.byteLength + footerBytes.length);
+  body.set(metaBytes, 0);
+  body.set(headerBytes, metaBytes.length);
+  body.set(new Uint8Array(bytes), metaBytes.length + headerBytes.length);
+  body.set(footerBytes, metaBytes.length + headerBytes.length + bytes.byteLength);
+
+  const upload = await requestUrl({
+    url: GOOGLE_DRIVE_UPLOAD_URL,
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": `multipart/related; boundary=${boundary}`,
+    },
+    body: body.buffer,
+    throw: false,
+  });
+
+  if (upload.status < 200 || upload.status >= 300) {
+    const detail = typeof upload.json === "object" ? JSON.stringify(upload.json).slice(0, 240) : "";
+    if (upload.status === 403) {
+      await clearGoogleTokens(plugin);
+    }
+    throw new Error(
+      `Falha ao enviar imagem ao Drive (HTTP ${upload.status}). ` +
+        `Rode Connect Google account de novo e aceite Drive. ${detail}`
+    );
+  }
+
+  const uploaded = upload.json as { id?: string };
+  if (!uploaded.id) {
+    throw new Error("Drive nao retornou id do arquivo da imagem.");
+  }
+
+  return finish(uploaded.id);
+}
+
+async function appendImageToDoc(
+  plugin: GoogleDocsHubPlugin,
+  docId: string,
+  tabId: string | undefined,
+  imagePath: string,
+  driveFolderId?: string,
+  sessionCache?: Map<string, string>
+): Promise<void> {
+  const file = resolveVaultImageFile(plugin, imagePath);
+  if (!file) {
+    new Notice(`Imagem nao encontrada no vault: ${imagePath}`);
+    await appendBlocksToDoc(plugin, docId, tabId, [
+      { type: "paragraph", tokens: [{ text: `[imagem ausente: ${imagePath}]` }] },
+    ]);
+    return;
+  }
+
+  const uri = await uploadImageToDriveForDocs(plugin, file, driveFolderId, sessionCache);
+  const doc = await fetchGoogleDoc(plugin, docId);
+  const endIndex = getDocBodyEndIndex(doc, tabId);
+  const insertAt = Math.max(1, endIndex - 1);
+
+  // Quebra de paragrafo antes da imagem (inline image precisa estar dentro de um paragrafo)
+  await docsBatchUpdate(
+    plugin,
+    docId,
+    [{ insertText: { location: { index: insertAt }, text: "\n" } }],
+    tabId
+  );
+
+  const afterBreak = await fetchGoogleDoc(plugin, docId);
+  const imageAt = Math.max(1, getDocBodyEndIndex(afterBreak, tabId) - 1);
+
+  await docsBatchUpdate(
+    plugin,
+    docId,
+    [
+      {
+        insertInlineImage: {
+          uri,
+          location: { index: imageAt },
+        },
+      },
+    ],
+    tabId
+  );
+
+  const afterImage = await fetchGoogleDoc(plugin, docId);
+  const newlineAt = Math.max(1, getDocBodyEndIndex(afterImage, tabId) - 1);
+  await docsBatchUpdate(
+    plugin,
+    docId,
+    [{ insertText: { location: { index: newlineAt }, text: "\n" } }],
+    tabId
+  );
+}
+
 function calloutToTableRows(title: string, body: string): TableCellData[][] {
   const text = body.trim() ? `**${title}**\n${body}` : `**${title}**`;
   return [[{ text, backgroundColor: CALLOUT_CELL_BG }]];
@@ -1800,7 +2843,27 @@ async function appendTableToDoc(
       const cell = styledRows[r]?.tableCells?.[c];
       if (!cell) continue;
 
-      if (cellData.backgroundColor) {
+      if (cellData.backgroundColor || cellData.borderColor) {
+        const tableCellStyle: Record<string, unknown> = {};
+        const fields: string[] = [];
+        if (cellData.backgroundColor) {
+          tableCellStyle.backgroundColor = {
+            color: { rgbColor: hexToRgbColor(cellData.backgroundColor) },
+          };
+          fields.push("backgroundColor");
+        }
+        if (cellData.borderColor && (cellData.borderWidthPt ?? 0) > 0) {
+          const border = {
+            width: { magnitude: cellData.borderWidthPt, unit: "PT" },
+            color: { color: { rgbColor: hexToRgbColor(cellData.borderColor) } },
+            dashStyle: "SOLID",
+          };
+          tableCellStyle.borderTop = border;
+          tableCellStyle.borderBottom = border;
+          tableCellStyle.borderLeft = border;
+          tableCellStyle.borderRight = border;
+          fields.push("borderTop", "borderBottom", "borderLeft", "borderRight");
+        }
         styleRequests.push({
           updateTableCellStyle: {
             tableRange: {
@@ -1809,16 +2872,11 @@ async function appendTableToDoc(
                 rowIndex: r,
                 columnIndex: c,
               },
-              // API exige rowSpan/columnSpan > 0 (omitidos viram 0 → HTTP 400)
               rowSpan: 1,
               columnSpan: 1,
             },
-            tableCellStyle: {
-              backgroundColor: {
-                color: { rgbColor: hexToRgbColor(cellData.backgroundColor) },
-              },
-            },
-            fields: "backgroundColor",
+            tableCellStyle,
+            fields: fields.join(","),
           },
         });
       }
@@ -1835,35 +2893,116 @@ async function appendTableToDoc(
   await docsBatchUpdate(plugin, docId, styleRequests, tabId);
 }
 
+type HubJobKind = "publish" | "sync" | "merge" | "link" | "tabs";
+
+interface HubProgress {
+  set(label: string, percent: number): void;
+  tick(label: string): void;
+}
+
+/** Conta unidades de trabalho do Publish (cada tabela/img/chunk de texto = 1). */
+function countPublishUnits(blocks: MarkdownBlock[]): number {
+  const isStructural = (b: MarkdownBlock) =>
+    b.type === "table" || b.type === "callout" || b.type === "code" || b.type === "image";
+  let units = 0;
+  let i = 0;
+  while (i < blocks.length) {
+    if (isStructural(blocks[i])) {
+      units++;
+      i++;
+      continue;
+    }
+    while (i < blocks.length && !isStructural(blocks[i])) i++;
+    units++;
+  }
+  return Math.max(units, 1);
+}
+
 async function publishNoteToDoc(
   plugin: GoogleDocsHubPlugin,
   doc: any,
   docId: string,
   markdown: string,
-  tabId?: string
+  tabId?: string,
+  progress?: HubProgress | null
 ): Promise<void> {
   const blocks = parseMarkdownBlocks(markdown);
+  const bodyUnits = countPublishUnits(blocks);
+  // pasta + limpar + body
+  const totalSteps = 2 + bodyUnits;
+  let step = 0;
+  const report = (label: string) => {
+    step = Math.min(step + 1, totalSteps);
+    progress?.set(label, Math.round((step / totalSteps) * 100));
+  };
+
+  // Pasta: Meu Drive / Google Docs Hub / {titulo do Doc}/  (Doc + imagens)
+  let driveFolderId: string | undefined;
+  const hasImages = blocks.some((b) => b.type === "image");
+  const folderLabel = sanitizeDriveFolderName(String(doc.title ?? "Sem titulo"));
+  progress?.set("Preparando pasta no Drive...", 2);
+  try {
+    await ensureFullDriveScopeOrThrow(plugin);
+    driveFolderId = await ensureDocDriveFolder(plugin, folderLabel);
+    const move = await tryMoveDriveFileToFolder(plugin, docId, driveFolderId);
+    if (move.ok && !move.alreadyThere) {
+      new Notice(`Doc movido para Google Docs Hub / ${folderLabel}`);
+    } else if (!move.ok) {
+      new Notice(
+        `Pasta pronta, mas o Doc nao foi movido (HTTP ${move.status ?? "?"}). Confira o escopo Drive completo.`
+      );
+    }
+  } catch (err) {
+    console.error(err);
+    const msg = err instanceof Error ? err.message : String(err);
+    new Notice(msg);
+    if (hasImages) throw err;
+  }
+  report("Pasta pronta");
+
+  progress?.set("Limpando o Doc...", Math.round((step / totalSteps) * 100));
   await clearDocBody(plugin, doc, docId, tabId);
+  report("Doc limpo");
+
+  const imageSessionCache = new Map<string, string>();
 
   const isStructural = (b: MarkdownBlock) =>
-    b.type === "table" || b.type === "callout" || b.type === "code";
+    b.type === "table" || b.type === "callout" || b.type === "code" || b.type === "image";
 
-  // Publica em segmentos: texto/listas, tabelas/callouts/codigo-caixa (API exige re-get)
   let i = 0;
+  let imageIndex = 0;
+  const imageTotal = blocks.filter((b) => b.type === "image").length;
   while (i < blocks.length) {
     const block = blocks[i];
     if (block.type === "table") {
+      progress?.set("Publicando tabela...", Math.round((step / totalSteps) * 100));
       await appendTableToDoc(plugin, docId, tabId, block.rows);
+      report("Tabela publicada");
       i++;
       continue;
     }
     if (block.type === "callout") {
+      progress?.set("Publicando callout...", Math.round((step / totalSteps) * 100));
       await appendTableToDoc(plugin, docId, tabId, calloutToTableRows(block.title, block.body));
+      report("Callout publicado");
       i++;
       continue;
     }
     if (block.type === "code") {
+      progress?.set("Publicando codigo...", Math.round((step / totalSteps) * 100));
       await appendTableToDoc(plugin, docId, tabId, codeBlockToTableRows(block.text));
+      report("Codigo publicado");
+      i++;
+      continue;
+    }
+    if (block.type === "image") {
+      imageIndex++;
+      progress?.set(
+        `Enviando imagem ${imageIndex}/${Math.max(imageTotal, 1)}...`,
+        Math.round((step / totalSteps) * 100)
+      );
+      await appendImageToDoc(plugin, docId, tabId, block.path, driveFolderId, imageSessionCache);
+      report(`Imagem ${imageIndex} ok`);
       i++;
       continue;
     }
@@ -1873,8 +3012,12 @@ async function publishNoteToDoc(
       chunk.push(blocks[i]);
       i++;
     }
+    progress?.set("Publicando texto...", Math.round((step / totalSteps) * 100));
     await appendBlocksToDoc(plugin, docId, tabId, chunk);
+    report("Texto publicado");
   }
+
+  progress?.set("Finalizando...", 98);
 }
 
 // Publica sem nenhum conflito pendente: escreve no Doc e atualiza o "carimbo" de ultima sincronizacao
@@ -1886,10 +3029,11 @@ async function runPublishFlow(
   content: string,
   tabId?: string
 ): Promise<void> {
-  new Notice("Publicando nota no Google Docs...");
+  if (!plugin.beginJob("publish", "Publicando nota no Google Docs...")) return;
   try {
-    await publishNoteToDoc(plugin, doc, docId, content, tabId);
+    await publishNoteToDoc(plugin, doc, docId, content, tabId, plugin.jobProgress ?? undefined);
 
+    plugin.jobProgress?.set("Atualizando metadados...", 99);
     const updatedDoc = await fetchGoogleDoc(plugin, docId);
     const localHash = hashContent(content);
     await plugin.app.fileManager.processFrontMatter(file, (fm) => {
@@ -1897,34 +3041,50 @@ async function runPublishFlow(
       fm[FRONTMATTER_LAST_SYNCED_HASH_KEY] = localHash;
     });
 
-    new Notice("Nota publicada com sucesso no Google Docs.");
+    plugin.endJob(true, "Nota publicada com sucesso no Google Docs.");
   } catch (err) {
     console.error(err);
-    new Notice(`Falha ao publicar: ${(err as Error).message}`);
+    plugin.endJob(false, `Falha ao publicar: ${(err as Error).message}`);
   }
 }
 
 // Sincroniza sem nenhum conflito pendente: traz o Doc pra nota e atualiza o "carimbo" de ultima sincronizacao
-async function runSyncFlow(plugin: GoogleDocsHubPlugin, file: TFile, doc: any, tabId?: string): Promise<void> {
-  new Notice("Trazendo o conteudo do Google Docs para a nota...");
+async function runSyncFlow(
+  plugin: GoogleDocsHubPlugin,
+  file: TFile,
+  doc: any,
+  tabId?: string,
+  docId?: string
+): Promise<void> {
+  if (!plugin.beginJob("sync", "Puxando Google Docs para a nota...")) return;
   try {
-    const docText = convertDocToMarkdown(doc, tabId);
+    plugin.jobProgress?.set("Lendo o Doc...", 15);
+    const docText = await convertDocToMarkdown(plugin, doc, tabId, docId, file);
     const tableCount = (docText.match(/^\| .+\|$/gm) || []).length;
     const codeFenceCount = Math.floor((docText.match(/^```/gm) || []).length / 2);
 
+    plugin.jobProgress?.set("Escrevendo na nota...", 70);
     await plugin.app.vault.process(file, (data) => {
       const frontmatterMatch = data.match(FRONTMATTER_BLOCK_PATTERN);
       const frontmatterBlock = frontmatterMatch ? frontmatterMatch[0] : "";
       return frontmatterBlock + docText;
     });
 
+    plugin.jobProgress?.set("Atualizando metadados...", 90);
     const newHash = hashContent(docText);
     await plugin.app.fileManager.processFrontMatter(file, (fm) => {
       fm[FRONTMATTER_LAST_SYNCED_REVISION_KEY] = doc.revisionId;
       fm[FRONTMATTER_LAST_SYNCED_HASH_KEY] = newHash;
     });
 
-    new Notice(
+    try {
+      await refreshFolderMapaForNote(plugin, file);
+    } catch (mapErr) {
+      console.warn("Mapa nao atualizado apos Puxar Doc:", mapErr);
+    }
+
+    plugin.endJob(
+      true,
       `Nota atualizada com o Google Docs` +
         (tableCount || codeFenceCount
           ? ` (${tableCount} linha(s) de tabela, ${codeFenceCount} bloco(s) de codigo).`
@@ -1932,7 +3092,7 @@ async function runSyncFlow(plugin: GoogleDocsHubPlugin, file: TFile, doc: any, t
     );
   } catch (err) {
     console.error(err);
-    new Notice(`Falha ao sincronizar: ${(err as Error).message}`);
+    plugin.endJob(false, `Falha ao sincronizar: ${(err as Error).message}`);
   }
 }
 
@@ -1944,11 +3104,12 @@ async function applyMergedContent(
   mergedContent: string,
   tabId?: string
 ): Promise<void> {
-  new Notice("Aplicando a versao revisada na nota e no Google Docs...");
+  if (!plugin.beginJob("merge", "Aplicando versão revisada...")) return;
   try {
     const doc = await fetchGoogleDoc(plugin, docId);
-    await publishNoteToDoc(plugin, doc, docId, mergedContent, tabId);
+    await publishNoteToDoc(plugin, doc, docId, mergedContent, tabId, plugin.jobProgress ?? undefined);
 
+    plugin.jobProgress?.set("Gravando na nota...", 92);
     await plugin.app.vault.process(file, (data) => {
       const frontmatterMatch = data.match(FRONTMATTER_BLOCK_PATTERN);
       const frontmatterBlock = frontmatterMatch ? frontmatterMatch[0] : "";
@@ -1962,10 +3123,10 @@ async function applyMergedContent(
       fm[FRONTMATTER_LAST_SYNCED_HASH_KEY] = mergedHash;
     });
 
-    new Notice("Versao revisada aplicada com sucesso nos dois lados.");
+    plugin.endJob(true, "Versão revisada aplicada com sucesso nos dois lados.");
   } catch (err) {
     console.error(err);
-    new Notice(`Falha ao aplicar a versao revisada: ${(err as Error).message}`);
+    plugin.endJob(false, `Falha ao aplicar a versao revisada: ${(err as Error).message}`);
   }
 }
 
@@ -2105,7 +3266,7 @@ async function publishNoteCommand(plugin: GoogleDocsHubPlugin, file: TFile): Pro
     const hasPriorSync = Boolean(lastRevision && lastHash);
     // Compara o conteudo da GUIA especifica, nao o revisionId do documento inteiro - senao, editar
     // outra guia desse mesmo Doc dispararia um aviso de conflito falso nesta nota.
-    const remoteContent = convertDocToMarkdown(doc, tabId);
+    const remoteContent = await convertDocToMarkdown(plugin, doc, tabId, docId, file);
     const remoteChanged = hasPriorSync && hashContent(remoteContent) !== lastHash;
 
     if (remoteChanged) {
@@ -2125,6 +3286,7 @@ async function publishNoteCommand(plugin: GoogleDocsHubPlugin, file: TFile): Pro
     await runPublishFlow(plugin, file, doc, docId, content, tabId);
   } catch (err) {
     console.error(err);
+    if (await offerUnlinkIfDocGone(plugin, file, err)) return;
     new Notice(`Falha ao publicar: ${(err as Error).message}`);
   }
 }
@@ -2152,7 +3314,7 @@ async function syncNowCommand(plugin: GoogleDocsHubPlugin, file: TFile): Promise
     const localChanged = hasPriorSync && localHash !== lastHash;
 
     if (localChanged) {
-      const remoteContent = convertDocToMarkdown(doc, tabId);
+      const remoteContent = await convertDocToMarkdown(plugin, doc, tabId, docId, file);
       // Sync: padrao = manter o Doc (hub), pra nao perder Calibri/espacamento/linha do titulo
       new MergeReviewModal(
         plugin.app,
@@ -2166,9 +3328,10 @@ async function syncNowCommand(plugin: GoogleDocsHubPlugin, file: TFile): Promise
       return;
     }
 
-    await runSyncFlow(plugin, file, doc, tabId);
+    await runSyncFlow(plugin, file, doc, tabId, docId);
   } catch (err) {
     console.error(err);
+    if (await offerUnlinkIfDocGone(plugin, file, err)) return;
     new Notice(`Falha ao sincronizar: ${(err as Error).message}`);
   }
 }
@@ -2313,6 +3476,476 @@ class TabChoiceModal extends Modal {
   }
 }
 
+function noteBodyWithoutFrontmatter(raw: string): string {
+  return raw.replace(FRONTMATTER_BLOCK_PATTERN, "");
+}
+
+async function writeNoteDocLink(
+  plugin: GoogleDocsHubPlugin,
+  file: TFile,
+  docId: string,
+  url: string,
+  tabId?: string
+): Promise<void> {
+  await plugin.app.fileManager.processFrontMatter(file, (frontmatter) => {
+    frontmatter[FRONTMATTER_DOC_ID_KEY] = docId;
+    frontmatter[FRONTMATTER_DOC_URL_KEY] = url;
+    if (tabId) frontmatter[FRONTMATTER_DOC_TAB_ID_KEY] = tabId;
+    else delete frontmatter[FRONTMATTER_DOC_TAB_ID_KEY];
+  });
+}
+
+async function createBlankGoogleDoc(
+  plugin: GoogleDocsHubPlugin,
+  title: string
+): Promise<{ docId: string; url: string; doc: any }> {
+  await ensureFullDriveScopeOrThrow(plugin);
+  const accessToken = await ensureFreshAccessToken(plugin);
+  const created = await requestUrl({
+    url: GOOGLE_DOCS_API_URL,
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ title }),
+    throw: false,
+  });
+  if (created.status < 200 || created.status >= 300 || !created.json?.documentId) {
+    throw new Error(`Falha ao criar Doc (HTTP ${created.status}).`);
+  }
+  const docId = created.json.documentId as string;
+  const url = `https://docs.google.com/document/d/${docId}/edit`;
+
+  // Organiza no Drive: Google Docs Hub / {titulo}/
+  try {
+    const folderId = await ensureDocDriveFolder(plugin, title);
+    await tryMoveDriveFileToFolder(plugin, docId, folderId);
+  } catch (err) {
+    console.warn("[Google Docs Hub] Doc criado, mas pasta Drive falhou:", err);
+  }
+
+  const doc = await fetchGoogleDoc(plugin, docId);
+  return { docId, url, doc };
+}
+
+/** Notas .md irmas na mesma pasta (inclui a nota atual). */
+/** Notas mapa do vault (ex.: Pastinha_Mapa) nao viram guia no Google Doc. */
+function isObsidianMapaNote(file: TFile): boolean {
+  return /_Mapa$/i.test(file.basename) || /^00_Mapa/i.test(file.basename);
+}
+
+function listSiblingMarkdownNotes(plugin: GoogleDocsHubPlugin, file: TFile): TFile[] {
+  const folder = file.parent;
+  if (!folder) return [file];
+  return folder.children
+    .filter((f): f is TFile => {
+      if (!(f instanceof TFile) || f.extension !== "md") return false;
+      if (isObsidianMapaNote(f)) return false;
+      const hubMapa = plugin.app.metadataCache.getFileCache(f)?.frontmatter?.[FRONTMATTER_HUB_MAPA_KEY];
+      if (hubMapa === true || hubMapa === "true") return false;
+      return true;
+    })
+    .sort((a, b) => a.basename.localeCompare(b.basename, "pt-BR"));
+}
+
+/** Lista imagens dentro de `gdocs-media/` (png/jpg/…). */
+function isImageFileName(nameOrExt: string): boolean {
+  return /^(png|jpe?g|gif|webp|svg|bmp)$/i.test(nameOrExt.replace(/^\./, "")) ||
+    /\.(png|jpe?g|gif|webp|svg|bmp)$/i.test(nameOrExt);
+}
+
+function listGdocsMediaImages(plugin: GoogleDocsHubPlugin, mediaFolderPath: string): TFile[] {
+  const folder = plugin.app.vault.getAbstractFileByPath(mediaFolderPath);
+  if (folder instanceof TFolder) {
+    return folder.children
+      .filter((child): child is TFile => {
+        if (!(child instanceof TFile)) return false;
+        // Obsidian: TFile.extension vem SEM ponto ("png"), nao ".png"
+        return isImageFileName(child.extension) || isImageFileName(child.name);
+      })
+      .sort((a, b) => a.name.localeCompare(b.name, "pt-BR"));
+  }
+
+  const prefix = mediaFolderPath ? `${mediaFolderPath}/` : "";
+  return plugin.app.vault
+    .getFiles()
+    .filter((f) => {
+      if (!prefix || !f.path.startsWith(prefix)) return false;
+      if (f.path.slice(prefix.length).includes("/")) return false;
+      return isImageFileName(f.extension) || isImageFileName(f.name);
+    })
+    .sort((a, b) => a.name.localeCompare(b.name, "pt-BR"));
+}
+
+/**
+ * Cria/atualiza o mapa DENTRO de `gdocs-media/` (lista as imagens).
+ * Ex.: `Pasta/gdocs-media/gdocs-media_Mapa.md`
+ */
+async function ensureMediaMapaNote(
+  plugin: GoogleDocsHubPlugin,
+  mediaFolderPath: string
+): Promise<string | null> {
+  const images = listGdocsMediaImages(plugin, mediaFolderPath);
+  if (images.length === 0) return null;
+
+  await ensureVaultFolder(plugin, mediaFolderPath);
+  const mapaBase = `${GDOCS_MEDIA_FOLDER}_Mapa`;
+  const mapaPath = `${mediaFolderPath}/${mapaBase}.md`;
+
+  const links = images.map((f) => `- [[${f.name}]]`).join("\n");
+  const body =
+    `---\n` +
+    `${FRONTMATTER_HUB_MAPA_KEY}: true\n` +
+    `---\n\n` +
+    `# ${GDOCS_MEDIA_FOLDER} - Mapa\n\n` +
+    `## Imagens\n\n` +
+    `${links}\n\n` +
+    `---\n` +
+    `> Mapa local das imagens baixadas do Google Docs. Não sobe pro Google Docs.\n`;
+
+  const existing = plugin.app.vault.getAbstractFileByPath(mapaPath);
+  if (existing instanceof TFile) {
+    await plugin.app.vault.modify(existing, body);
+  } else {
+    await plugin.app.vault.create(mapaPath, body);
+  }
+  return mapaPath;
+}
+
+/** Cria/atualiza `{Pasta}_Mapa.md` local (só Obsidian / grafo). Sem google_doc_*. */
+async function ensureFolderMapaNote(
+  plugin: GoogleDocsHubPlugin,
+  folderPath: string,
+  folderName: string,
+  notes: TFile[]
+): Promise<string> {
+  const mapaBase = `${sanitizeFileName(folderName).replace(/\s+/g, "_")}_Mapa`;
+  const mapaPath = folderPath ? `${folderPath}/${mapaBase}.md` : `${mapaBase}.md`;
+
+  const links = notes
+    .slice()
+    .sort((a, b) => a.basename.localeCompare(b.basename, "pt-BR"))
+    .map((n) => `- [[${n.basename}]]`)
+    .join("\n");
+
+  // Mapa de midia fica DENTRO de gdocs-media; o mapa global só linka esse arquivo
+  const mediaFolderPath = folderPath ? `${folderPath}/${GDOCS_MEDIA_FOLDER}` : GDOCS_MEDIA_FOLDER;
+  const mediaMapaPath = await ensureMediaMapaNote(plugin, mediaFolderPath);
+  const mediaMapaSection = mediaMapaPath
+    ? `\n## Mídia\n\n- [[${GDOCS_MEDIA_FOLDER}/${GDOCS_MEDIA_FOLDER}_Mapa|${GDOCS_MEDIA_FOLDER}]]\n`
+    : "";
+
+  const body =
+    `---\n` +
+    `${FRONTMATTER_HUB_MAPA_KEY}: true\n` +
+    `---\n\n` +
+    `# ${folderName} - Mapa\n\n` +
+    `## Notas (guias do Google Doc)\n\n` +
+    `${links || "_Nenhuma nota._"}\n` +
+    mediaMapaSection +
+    `\n---\n` +
+    `> Mapa local do Obsidian para o grafo. Não sobe pro Google Docs.\n`;
+
+  const existing = plugin.app.vault.getAbstractFileByPath(mapaPath);
+  if (existing instanceof TFile) {
+    await plugin.app.vault.modify(existing, body);
+  } else {
+    const parent = folderPath;
+    if (parent) await ensureVaultFolder(plugin, parent);
+    await plugin.app.vault.create(mapaPath, body);
+  }
+  return mapaPath;
+}
+
+/** Atualiza o *_Mapa da pasta (notas + imagens) a partir de qualquer nota vinculada. */
+async function refreshFolderMapaForNote(plugin: GoogleDocsHubPlugin, file: TFile): Promise<void> {
+  const folderPath = file.path.includes("/") ? file.path.slice(0, file.path.lastIndexOf("/")) : "";
+  const folderName = folderPath.split("/").filter(Boolean).pop() || "Vault";
+  const fm = plugin.app.metadataCache.getFileCache(file)?.frontmatter;
+  const docId = fm?.[FRONTMATTER_DOC_ID_KEY] as string | undefined;
+
+  const siblings = (
+    folderPath
+      ? plugin.app.vault.getFiles().filter((f) => {
+          const parent = f.path.includes("/") ? f.path.slice(0, f.path.lastIndexOf("/")) : "";
+          return parent === folderPath && f.extension === "md";
+        })
+      : plugin.app.vault.getFiles().filter((f) => !f.path.includes("/") && f.extension === "md")
+  ).filter((f) => {
+    if (isObsidianMapaNote(f)) return false;
+    const hub = plugin.app.metadataCache.getFileCache(f)?.frontmatter?.[FRONTMATTER_HUB_MAPA_KEY];
+    if (hub === true || hub === "true") return false;
+    if (!docId) return true;
+    return plugin.app.metadataCache.getFileCache(f)?.frontmatter?.[FRONTMATTER_DOC_ID_KEY] === docId;
+  });
+
+  if (siblings.length === 0) return;
+  await ensureFolderMapaNote(plugin, folderPath, folderName, siblings);
+  // Estrela no grafo: remove arestas nota→imagem (![[wiki]]), deixa só gdocs-media_Mapa→imagem
+  for (const note of siblings) {
+    try {
+      await rewriteGdocsWikiEmbedsToMarkdownImages(plugin, note);
+    } catch (err) {
+      console.warn("Falha ao normalizar embeds de imagem:", note.path, err);
+    }
+  }
+}
+
+/**
+ * Converte ![[...gdocs-media...]] → ![](...) nas notas.
+ * Wiki-embed cria link no grafo (floco); markdown image nao.
+ */
+async function rewriteGdocsWikiEmbedsToMarkdownImages(
+  plugin: GoogleDocsHubPlugin,
+  file: TFile
+): Promise<boolean> {
+  const raw = await plugin.app.vault.read(file);
+  const next = raw.replace(/!\[\[([^\]]+)\]\]/g, (_full, inner: string) => {
+    const path = normalizeImagePath(String(inner).split("|")[0].trim());
+    if (!path) return _full;
+    const looksMedia =
+      path.includes(`/${GDOCS_MEDIA_FOLDER}/`) ||
+      path.startsWith(`${GDOCS_MEDIA_FOLDER}/`) ||
+      isImageFileName(path);
+    if (!looksMedia) return _full;
+    return `![](${path})`;
+  });
+  if (next === raw) return false;
+  await plugin.app.vault.modify(file, next);
+  return true;
+}
+
+async function renameDocTab(
+  plugin: GoogleDocsHubPlugin,
+  docId: string,
+  tabId: string,
+  title: string
+): Promise<void> {
+  // tabId vai DENTRO de tabProperties (nao no root do updateDocumentTabProperties)
+  await docsBatchUpdate(plugin, docId, [
+    {
+      updateDocumentTabProperties: {
+        tabProperties: {
+          tabId,
+          title,
+        },
+        fields: "title",
+      },
+    },
+  ]);
+}
+
+async function addDocTab(
+  plugin: GoogleDocsHubPlugin,
+  docId: string,
+  title: string
+): Promise<string> {
+  const res = await docsBatchUpdate(plugin, docId, [
+    {
+      addDocumentTab: {
+        tabProperties: { title },
+      },
+    },
+  ]);
+  const tabId = res?.replies?.[0]?.addDocumentTab?.tabProperties?.tabId as string | undefined;
+  if (!tabId) {
+    // Fallback: recarrega o Doc e pega a ultima guia
+    const doc = await fetchGoogleDoc(plugin, docId);
+    const tabs = listDocTabs(doc);
+    const last = tabs[tabs.length - 1]?.tabId;
+    if (!last) throw new Error("API nao devolveu tabId da guia criada.");
+    return last;
+  }
+  return tabId;
+}
+
+async function publishNoteContentToTab(
+  plugin: GoogleDocsHubPlugin,
+  file: TFile,
+  docId: string,
+  tabId: string
+): Promise<void> {
+  const raw = await plugin.app.vault.read(file);
+  const content = noteBodyWithoutFrontmatter(raw);
+  const doc = await fetchGoogleDoc(plugin, docId);
+  await publishNoteToDoc(plugin, doc, docId, content, tabId, plugin.jobProgress ?? undefined);
+
+  const updated = await fetchGoogleDoc(plugin, docId);
+  const hash = hashContent(content);
+  await plugin.app.fileManager.processFrontMatter(file, (fm) => {
+    fm[FRONTMATTER_LAST_SYNCED_REVISION_KEY] = updated.revisionId;
+    fm[FRONTMATTER_LAST_SYNCED_HASH_KEY] = hash;
+  });
+}
+
+/** Cria Doc so pra nota atual (1 guia). */
+async function createDocForSingleNote(plugin: GoogleDocsHubPlugin, file: TFile): Promise<void> {
+  if (!plugin.beginJob("link", "Criando Google Doc...")) return;
+  try {
+    const title = file.basename;
+    plugin.jobProgress?.set("Criando Doc no Google...", 10);
+    const { docId, url, doc } = await createBlankGoogleDoc(plugin, title);
+    const tabs = listDocTabs(doc);
+    const tabId = tabs[0]?.tabId;
+
+    plugin.jobProgress?.set("Vinculando nota...", 40);
+    if (tabId) {
+      try {
+        await renameDocTab(plugin, docId, tabId, title);
+      } catch (err) {
+        console.warn("[Google Docs Hub] Renomear guia falhou; seguindo com o link.", err);
+      }
+    }
+    await writeNoteDocLink(plugin, file, docId, url, tabId);
+
+    plugin.jobProgress?.set("Publicando conteudo...", 55);
+    await publishNoteContentToTab(plugin, file, docId, tabId ?? tabs[0]?.tabId);
+
+    plugin.endJob(true, `Doc criado e vinculado: ${title}`);
+  } catch (err) {
+    console.error(err);
+    plugin.endJob(false, `Falha ao criar Doc: ${(err as Error).message}`);
+  }
+}
+
+/**
+ * Cria 1 Doc com 1 guia por nota da pasta (titulo do Doc = nome da pasta).
+ * Publica o conteudo de cada nota na guia correspondente.
+ */
+async function createDocForFolderNotes(
+  plugin: GoogleDocsHubPlugin,
+  activeFile: TFile,
+  notes: TFile[]
+): Promise<void> {
+  if (!plugin.beginJob("link", "Criando Doc com guias da pasta...")) return;
+  try {
+    const folderName = activeFile.parent?.name || activeFile.basename;
+    plugin.jobProgress?.set("Criando Doc no Google...", 5);
+    const { docId, url, doc } = await createBlankGoogleDoc(plugin, folderName);
+
+    let firstTabId = listDocTabs(doc)[0]?.tabId;
+    if (!firstTabId) throw new Error("Doc novo sem guia inicial.");
+
+    // Ordena: nota ativa primeiro (fica na 1a guia), resto por nome
+    const ordered = [
+      activeFile,
+      ...notes.filter((n) => n.path !== activeFile.path),
+    ];
+
+    const mapping: Array<{ file: TFile; tabId: string }> = [];
+
+    plugin.jobProgress?.set(`Guia 1/${ordered.length}: ${ordered[0].basename}`, 15);
+    try {
+      await renameDocTab(plugin, docId, firstTabId, ordered[0].basename);
+    } catch (err) {
+      console.warn("[Google Docs Hub] Renomear 1a guia falhou; seguindo.", err);
+    }
+    mapping.push({ file: ordered[0], tabId: firstTabId });
+
+    for (let i = 1; i < ordered.length; i++) {
+      const note = ordered[i];
+      const pct = 15 + Math.round((i / ordered.length) * 35);
+      plugin.jobProgress?.set(`Criando guia ${i + 1}/${ordered.length}: ${note.basename}`, pct);
+      const tabId = await addDocTab(plugin, docId, note.basename);
+      mapping.push({ file: note, tabId });
+    }
+
+    for (let i = 0; i < mapping.length; i++) {
+      const { file, tabId } = mapping[i];
+      const pct = 50 + Math.round((i / mapping.length) * 40);
+      plugin.jobProgress?.set(`Publicando ${file.basename}...`, pct);
+      await writeNoteDocLink(plugin, file, docId, url, tabId);
+      await publishNoteContentToTab(plugin, file, docId, tabId);
+    }
+
+    plugin.jobProgress?.set("Criando mapa local...", 95);
+    const mapaFolder =
+      activeFile.path.includes("/") ? activeFile.path.slice(0, activeFile.path.lastIndexOf("/")) : "";
+    const mapaPath = await ensureFolderMapaNote(
+      plugin,
+      mapaFolder,
+      folderName,
+      mapping.map((m) => m.file)
+    );
+
+    plugin.endJob(
+      true,
+      `Doc "${folderName}" criado com ${mapping.length} guia(s). Mapa local: ${mapaPath.split("/").pop()}`
+    );
+  } catch (err) {
+    console.error(err);
+    plugin.endJob(false, `Falha ao criar Doc da pasta: ${(err as Error).message}`);
+  }
+}
+
+/** Modal: pasta com varias notas → Doc com guias? */
+class CreateDocChoiceModal extends Modal {
+  private note: TFile;
+  private siblings: TFile[];
+  private plugin: GoogleDocsHubPlugin;
+
+  constructor(app: App, plugin: GoogleDocsHubPlugin, note: TFile, siblings: TFile[]) {
+    super(app);
+    this.plugin = plugin;
+    this.note = note;
+    this.siblings = siblings;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    const folderName = this.note.parent?.name || this.note.parent?.path || "pasta";
+    new Setting(contentEl).setName("Criar Google Doc").setHeading();
+    contentEl.createEl("p", {
+      text:
+        `A pasta "${folderName}" tem ${this.siblings.length} notas. ` +
+        `Quer criar um Doc no Google com uma guia por nota?`,
+    });
+    contentEl.createEl("p", {
+      text: `Notas: ${this.siblings.map((f) => f.basename).join(", ")}`,
+      cls: "gdocs-hub-muted",
+    });
+
+    contentEl.createEl("button", {
+      text: `Sim: 1 Doc com ${this.siblings.length} guias`,
+      cls: "mod-cta gdocs-hub-block-button-spaced",
+    }).addEventListener("click", () => {
+      this.close();
+      void createDocForFolderNotes(this.plugin, this.note, this.siblings);
+    });
+
+    contentEl.createEl("button", {
+      text: "Não: só esta nota (1 Doc, 1 guia)",
+      cls: "gdocs-hub-block-button",
+    }).addEventListener("click", () => {
+      this.close();
+      void createDocForSingleNote(this.plugin, this.note);
+    });
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
+async function startCreateGoogleDocFlow(plugin: GoogleDocsHubPlugin, file: TFile): Promise<void> {
+  const existingId = plugin.app.metadataCache.getFileCache(file)?.frontmatter?.[FRONTMATTER_DOC_ID_KEY];
+  if (existingId) {
+    new Notice("Esta nota já está vinculada a um Doc. Use Publicar / Puxar Doc.");
+    return;
+  }
+
+  // Raiz do vault NÃO conta como pasta (ex.: "Sem título.md" e "SOL.md" juntos).
+  // Só pergunta se o path tem pasta real: "Minha Pasta/nota.md"
+  const inNamedFolder = file.path.includes("/");
+  const siblings = listSiblingMarkdownNotes(plugin, file);
+  if (inNamedFolder && siblings.length >= 2) {
+    new CreateDocChoiceModal(plugin.app, plugin, file, siblings).open();
+    return;
+  }
+  await createDocForSingleNote(plugin, file);
+}
+
 // Logica compartilhada de Link existing Doc: extrai o docId, checa se tem varias guias
 // (oferecendo importar todas ou escolher uma) e grava tudo no frontmatter.
 // Usada tanto pelo comando quanto pelo botao na nota.
@@ -2452,46 +4085,198 @@ async function runImportAllTabs(
   folderPath: string
 ): Promise<void> {
   new Notice(`Importando ${tabs.length} guias...`);
-
-  const normalizedFolder = folderPath.replace(/\/+$/, "");
-
   try {
-    if (normalizedFolder && !plugin.app.vault.getAbstractFileByPath(normalizedFolder)) {
-      await plugin.app.vault.createFolder(normalizedFolder);
-    }
-
-    let created = 0;
-    let skipped = 0;
-
-    for (const tab of tabs) {
-      const fileName = sanitizeFileName(tab.title);
-      const path = normalizedFolder ? `${normalizedFolder}/${fileName}.md` : `${fileName}.md`;
-
-      if (plugin.app.vault.getAbstractFileByPath(path)) {
-        skipped++;
-        continue;
-      }
-
-      const content = convertDocToMarkdown(doc, tab.tabId);
-      const frontmatter = [
-        "---",
-        `${FRONTMATTER_DOC_ID_KEY}: ${docId}`,
-        `${FRONTMATTER_DOC_URL_KEY}: ${docUrl}`,
-        `${FRONTMATTER_DOC_TAB_ID_KEY}: ${tab.tabId}`,
-        "---",
-        "",
-      ].join("\n");
-
-      await plugin.app.vault.create(path, frontmatter + content);
-      created++;
-    }
-
-    const skippedMessage = skipped > 0 ? `, ${skipped} ja existiam e foram puladas` : "";
-    new Notice(`Importacao concluida: ${created} notas criadas${skippedMessage}.`);
+    const result = await syncTabsIntoFolder(plugin, doc, docId, docUrl, tabs, folderPath);
+    const skippedMessage = result.skipped > 0 ? `, ${result.skipped} ja existiam e foram puladas` : "";
+    const mapaMessage = result.mapaName ? ` Mapa: ${result.mapaName}.` : "";
+    new Notice(`Importacao concluida: ${result.created} notas criadas${skippedMessage}.${mapaMessage}`);
   } catch (err) {
     console.error(err);
     new Notice(`Falha ao importar as guias: ${(err as Error).message}`);
   }
+}
+
+/**
+ * Garante nota por guia na pasta: cria as que faltam, reaproveita as que ja existem (por tab_id ou nome).
+ * Atualiza o mapa local. Nao sobrescreve conteudo de notas ja existentes.
+ */
+async function syncTabsIntoFolder(
+  plugin: GoogleDocsHubPlugin,
+  doc: any,
+  docId: string,
+  docUrl: string,
+  tabs: Array<{ tabId: string; title: string }>,
+  folderPath: string
+): Promise<{ created: number; skipped: number; noteFiles: TFile[]; mapaName: string }> {
+  const normalizedFolder = folderPath.replace(/\/+$/, "");
+
+  if (normalizedFolder && !plugin.app.vault.getAbstractFileByPath(normalizedFolder)) {
+    await ensureVaultFolder(plugin, normalizedFolder);
+  }
+
+  const folderFiles = (
+    normalizedFolder
+      ? plugin.app.vault.getFiles().filter((f) => {
+          const parent = f.path.includes("/") ? f.path.slice(0, f.path.lastIndexOf("/")) : "";
+          return parent === normalizedFolder && f.extension === "md";
+        })
+      : plugin.app.vault.getFiles().filter((f) => !f.path.includes("/") && f.extension === "md")
+  ).filter((f) => !isObsidianMapaNote(f));
+
+  let created = 0;
+  let skipped = 0;
+  const noteFiles: TFile[] = [];
+
+  for (const tab of tabs) {
+    const fileName = sanitizeFileName(tab.title);
+    const path = normalizedFolder ? `${normalizedFolder}/${fileName}.md` : `${fileName}.md`;
+
+    const byTabId = folderFiles.find((f) => {
+      const fm = plugin.app.metadataCache.getFileCache(f)?.frontmatter;
+      return fm?.[FRONTMATTER_DOC_ID_KEY] === docId && fm?.[FRONTMATTER_DOC_TAB_ID_KEY] === tab.tabId;
+    });
+    const byPath = plugin.app.vault.getAbstractFileByPath(path);
+
+    if (byTabId instanceof TFile) {
+      skipped++;
+      noteFiles.push(byTabId);
+      continue;
+    }
+
+    if (byPath instanceof TFile) {
+      // Nota com mesmo nome: garante vinculo da guia
+      await writeNoteDocLink(plugin, byPath, docId, docUrl, tab.tabId);
+      skipped++;
+      noteFiles.push(byPath);
+      continue;
+    }
+
+    const content = await convertDocToMarkdown(
+      plugin,
+      doc,
+      tab.tabId,
+      docId,
+      undefined,
+      normalizedFolder ? `${normalizedFolder}/${GDOCS_MEDIA_FOLDER}` : GDOCS_MEDIA_FOLDER
+    );
+    const frontmatter = [
+      "---",
+      `${FRONTMATTER_DOC_ID_KEY}: ${docId}`,
+      `${FRONTMATTER_DOC_URL_KEY}: ${docUrl}`,
+      `${FRONTMATTER_DOC_TAB_ID_KEY}: ${tab.tabId}`,
+      "---",
+      "",
+    ].join("\n");
+
+    const createdFile = await plugin.app.vault.create(path, frontmatter + content);
+    noteFiles.push(createdFile);
+    created++;
+  }
+
+  const folderName =
+    normalizedFolder.split("/").filter(Boolean).pop() ||
+    sanitizeFileName(String(doc.title ?? "Google Docs"));
+  let mapaName = "";
+  if (noteFiles.length > 0) {
+    const mapaPath = await ensureFolderMapaNote(plugin, normalizedFolder, folderName, noteFiles);
+    mapaName = mapaPath.split("/").pop() ?? "";
+    for (const note of noteFiles) {
+      try {
+        await rewriteGdocsWikiEmbedsToMarkdownImages(plugin, note);
+      } catch (err) {
+        console.warn("Falha ao normalizar embeds de imagem:", note.path, err);
+      }
+    }
+  }
+
+  return { created, skipped, noteFiles, mapaName };
+}
+
+/** A partir de uma nota ja vinculada (ou do Mapa da pasta): busca guias novas do Doc, cria notas + atualiza mapa. */
+async function updateGuiasFromLinkedNote(plugin: GoogleDocsHubPlugin, file: TFile): Promise<void> {
+  const resolved = resolveDocContextForTabUpdate(plugin, file);
+  if (!resolved) {
+    new Notice("Nao achei Doc vinculado nesta pasta. Abra uma nota com google_doc_id ou o Mapa dela.");
+    return;
+  }
+  const { docId, docUrl, folderPath } = resolved;
+
+  if (!plugin.beginJob("tabs", "Atualizando guias do Doc...")) return;
+  try {
+    plugin.jobProgress?.set("Lendo guias do Doc...", 20);
+    const doc = await fetchGoogleDoc(plugin, docId);
+    const tabs = listDocTabs(doc);
+    if (tabs.length === 0) {
+      plugin.endJob(false, "Esse Doc nao tem guias.");
+      return;
+    }
+
+    plugin.jobProgress?.set("Sincronizando notas da pasta...", 50);
+    const result = await syncTabsIntoFolder(plugin, doc, docId, docUrl, tabs, folderPath);
+
+    plugin.endJob(
+      true,
+      result.created > 0
+        ? `Atualizar guias: ${result.created} nota(s) nova(s). Mapa: ${result.mapaName || "ok"}.`
+        : `Nenhuma guia nova. Mapa atualizado (${result.noteFiles.length} nota(s)).`
+    );
+    plugin.refreshUi();
+  } catch (err) {
+    console.error(err);
+    const unlinkAnchor =
+      plugin.app.metadataCache.getFileCache(file)?.frontmatter?.[FRONTMATTER_DOC_ID_KEY]
+        ? file
+        : null;
+    if (unlinkAnchor && (await offerUnlinkIfDocGone(plugin, unlinkAnchor, err))) {
+      plugin.endJob(false, "Doc inacessivel.");
+      return;
+    }
+    plugin.endJob(false, `Falha ao atualizar guias: ${(err as Error).message}`);
+  }
+}
+
+function isHubMapaFile(plugin: GoogleDocsHubPlugin, file: TFile): boolean {
+  if (isObsidianMapaNote(file)) return true;
+  const hub = plugin.app.metadataCache.getFileCache(file)?.frontmatter?.[FRONTMATTER_HUB_MAPA_KEY];
+  return hub === true || hub === "true";
+}
+
+/** Resolve Doc + pasta para sincronizar guias (nota vinculada ou mapa da pasta). */
+function resolveDocContextForTabUpdate(
+  plugin: GoogleDocsHubPlugin,
+  file: TFile
+): { docId: string; docUrl: string; folderPath: string } | null {
+  const folderPath = file.path.includes("/") ? file.path.slice(0, file.path.lastIndexOf("/")) : "";
+  const fm = plugin.app.metadataCache.getFileCache(file)?.frontmatter;
+  let docId = fm?.[FRONTMATTER_DOC_ID_KEY] as string | undefined;
+  let docUrl = fm?.[FRONTMATTER_DOC_URL_KEY] as string | undefined;
+
+  if (!docId) {
+    const siblings =
+      folderPath
+        ? plugin.app.vault.getFiles().filter((f) => {
+            const parent = f.path.includes("/") ? f.path.slice(0, f.path.lastIndexOf("/")) : "";
+            return parent === folderPath && f.extension === "md" && !isObsidianMapaNote(f);
+          })
+        : plugin.app.vault.getFiles().filter((f) => !f.path.includes("/") && f.extension === "md" && !isObsidianMapaNote(f));
+
+    for (const sibling of siblings) {
+      const sfm = plugin.app.metadataCache.getFileCache(sibling)?.frontmatter;
+      const sid = sfm?.[FRONTMATTER_DOC_ID_KEY] as string | undefined;
+      if (sid) {
+        docId = sid;
+        docUrl = (sfm?.[FRONTMATTER_DOC_URL_KEY] as string | undefined) || docUrl;
+        break;
+      }
+    }
+  }
+
+  if (!docId) return null;
+  return {
+    docId,
+    docUrl: docUrl || `https://docs.google.com/document/d/${docId}/edit`,
+    folderPath,
+  };
 }
 
 // Abre o modal que pede a URL do Doc, usado tanto pelo comando quanto pelo icone da ribbon
@@ -2582,17 +4367,47 @@ class GoogleDocsHubSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Status da conta")
-      .setDesc(this.plugin.settings.refreshToken ? "Conectado." : "Ainda nao conectado.");
+      .setDesc(
+        this.plugin.settings.refreshToken
+          ? tokenHasFullDriveScope((this.plugin.settings.grantedScopes ?? "").split(/\s+/))
+            ? "Conectado (Docs + Drive completo)."
+            : tokenHasDriveScope((this.plugin.settings.grantedScopes ?? "").split(/\s+/))
+              ? "Conectado (Docs + drive.file). Reconecte com Drive completo pra mover Docs."
+              : "Conectado, mas SEM Drive. Reconecte pra Publish de imagens."
+          : "Ainda nao conectado."
+      )
+      .addButton((btn) =>
+        btn.setButtonText("Desconectar").onClick(async () => {
+          await clearGoogleTokens(this.plugin);
+          new Notice("Conta Google desconectada.");
+          this.display();
+        })
+      );
   }
 }
 
 export default class GoogleDocsHubPlugin extends Plugin {
   settings: GoogleDocsHubSettings;
   private docActionsByView = new Map<MarkdownView, HTMLElement[]>();
+  private statusBarEl: HTMLElement | null = null;
+  private progressBannerEl: HTMLElement | null = null;
+  private jobBusy = false;
+  private jobKind: HubJobKind | null = null;
+  private jobPercent = 0;
+  private jobLabel = "";
+  /** Reporter ativo enquanto um job roda (Publish/Sync/Merge). */
+  jobProgress: HubProgress | null = null;
 
   async onload() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
     this.addSettingTab(new GoogleDocsHubSettingTab(this.app, this));
+
+    this.statusBarEl = this.addStatusBarItem();
+    this.statusBarEl.addClass("gdocs-hub-status");
+    this.statusBarEl.setText("Docs Hub");
+
+    console.info(`[Google Docs Hub] loaded v${this.manifest.version}`);
+    new Notice(`Google Docs Hub v${this.manifest.version} carregado`);
 
     this.addCommand({
       id: "connect-google-account",
@@ -2604,15 +4419,17 @@ export default class GoogleDocsHubPlugin extends Plugin {
           return;
         }
 
-        new Notice("Abrindo o navegador para voce autorizar o Google Docs Hub...");
+        await clearGoogleTokens(this);
+        new Notice("Abrindo o navegador. Aceite Docs e Drive (imagens)...");
 
         try {
           const tokens = await runGoogleOAuthFlow(clientId, clientSecret);
           this.settings.accessToken = tokens.accessToken;
           this.settings.refreshToken = tokens.refreshToken;
           this.settings.accessTokenExpiresAt = tokens.expiresAt;
+          this.settings.grantedScopes = tokens.grantedScopes;
           await this.saveSettings();
-          new Notice("Conta Google conectada com sucesso.");
+          new Notice("Conta Google conectada (Docs + Drive completo).");
         } catch (err) {
           console.error(err);
           new Notice(`Falha ao conectar: ${(err as Error).message}`);
@@ -2627,6 +4444,10 @@ export default class GoogleDocsHubPlugin extends Plugin {
         const file = this.app.workspace.getActiveFile();
         if (!file) {
           new Notice("Abra uma nota antes de publicar.");
+          return;
+        }
+        if (this.jobBusy) {
+          new Notice("Aguarde: operação em andamento.");
           return;
         }
         void publishNoteCommand(this, file);
@@ -2650,6 +4471,19 @@ export default class GoogleDocsHubPlugin extends Plugin {
     });
 
     this.addCommand({
+      id: "create-google-doc",
+      name: "Create Google Doc from note",
+      callback: () => {
+        const file = this.app.workspace.getActiveFile();
+        if (!file) {
+          new Notice("Abra uma nota antes de criar um Google Doc.");
+          return;
+        }
+        void startCreateGoogleDocFlow(this, file);
+      },
+    });
+
+    this.addCommand({
       id: "import-doc-tabs",
       name: "Import all Doc tabs as notes",
       callback: () => openImportAllTabsModal(this),
@@ -2668,11 +4502,31 @@ export default class GoogleDocsHubPlugin extends Plugin {
           new Notice("Abra uma nota antes de sincronizar.");
           return;
         }
+        if (this.jobBusy) {
+          new Notice("Aguarde: operação em andamento.");
+          return;
+        }
         void syncNowCommand(this, file);
       },
     });
 
-    // Botoes na barra de titulo da nota (so aparecem quando a nota tem um Doc vinculado)
+    this.addCommand({
+      id: "update-doc-tabs",
+      name: "Atualizar guias do Doc",
+      callback: () => {
+        const file = this.app.workspace.getActiveFile();
+        if (!file) {
+          new Notice("Abra uma nota vinculada antes de atualizar as guias.");
+          return;
+        }
+        if (this.jobBusy) {
+          new Notice("Aguarde: operação em andamento.");
+          return;
+        }
+        void updateGuiasFromLinkedNote(this, file);
+      },
+    });
+
     this.registerEvent(this.app.workspace.on("active-leaf-change", () => this.refreshDocActions()));
     this.registerEvent(this.app.workspace.on("file-open", () => this.refreshDocActions()));
     this.registerEvent(
@@ -2684,13 +4538,120 @@ export default class GoogleDocsHubPlugin extends Plugin {
     this.app.workspace.onLayoutReady(() => this.refreshDocActions());
   }
 
-  // Cria um botao de acao com icone + texto do lado (a barra nativa do Obsidian e so-icone,
-  // aqui a gente anexa um <span> de texto manualmente porque foi pedido explicitamente)
-  private addLabeledAction(view: MarkdownView, icon: string, label: string, color: string, onClick: () => void) {
-    const el = view.addAction(icon, label, onClick);
-    el.addClass("gdocs-hub-action");
-    el.setCssProps({ "--gdocs-hub-action-color": color });
+  beginJob(kind: HubJobKind, label: string): boolean {
+    if (this.jobBusy) {
+      new Notice("Aguarde: já tem Sync/Publish em andamento.");
+      return false;
+    }
+    this.jobBusy = true;
+    this.jobKind = kind;
+    this.jobLabel = label;
+    this.jobPercent = 0;
+    this.jobProgress = {
+      set: (l, p) => this.updateJobProgress(l, p),
+      tick: (l) => this.updateJobProgress(l, Math.min(95, this.jobPercent + 5)),
+    };
+    this.ensureProgressBanner();
+    this.updateJobProgress(label, 0);
+    this.refreshDocActions();
+    return true;
+  }
 
+  updateJobProgress(label: string, percent: number): void {
+    this.jobLabel = label;
+    this.jobPercent = Math.max(0, Math.min(100, Math.round(percent)));
+    this.renderProgressUi();
+  }
+
+  endJob(ok: boolean, message: string): void {
+    this.jobPercent = 100;
+    this.jobLabel = ok ? "Concluído" : "Falhou";
+    this.renderProgressUi();
+
+    window.setTimeout(() => {
+      this.jobBusy = false;
+      this.jobKind = null;
+      this.jobProgress = null;
+      this.jobPercent = 0;
+      this.jobLabel = "";
+      this.clearProgressBanner();
+      this.renderProgressUi();
+      this.refreshDocActions();
+    }, ok ? 700 : 1200);
+
+    new Notice(message);
+  }
+
+  private ensureProgressBanner(): void {
+    this.clearProgressBanner();
+    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+    if (!view) return;
+
+    const host =
+      view.containerEl.querySelector(".view-header") ??
+      view.containerEl.querySelector(".workspace-leaf-content") ??
+      view.containerEl;
+
+    const banner = host.createDiv({ cls: "gdocs-hub-progress-banner" });
+    banner.createDiv({ cls: "gdocs-hub-progress-banner-label" });
+    const track = banner.createDiv({ cls: "gdocs-hub-progress-banner-track" });
+    track.createDiv({ cls: "gdocs-hub-progress-banner-fill" });
+    banner.createDiv({ cls: "gdocs-hub-progress-banner-pct" });
+    this.progressBannerEl = banner;
+  }
+
+  private clearProgressBanner(): void {
+    this.progressBannerEl?.remove();
+    this.progressBannerEl = null;
+  }
+
+  private renderProgressUi(): void {
+    if (this.statusBarEl) {
+      if (this.jobBusy) {
+        this.statusBarEl.setText(`Docs Hub · ${this.jobPercent}%`);
+        this.statusBarEl.addClass("is-busy");
+        this.statusBarEl.removeClass("is-ok");
+        this.statusBarEl.removeClass("is-err");
+      } else {
+        this.statusBarEl.setText("Docs Hub");
+        this.statusBarEl.removeClass("is-busy");
+      }
+    }
+
+    const banner = this.progressBannerEl;
+    if (!banner) return;
+    const labelEl = banner.querySelector(".gdocs-hub-progress-banner-label");
+    const fillEl = banner.querySelector(".gdocs-hub-progress-banner-fill");
+    const pctEl = banner.querySelector(".gdocs-hub-progress-banner-pct");
+    if (labelEl instanceof HTMLElement) labelEl.setText(this.jobLabel || "Processando...");
+    if (pctEl instanceof HTMLElement) pctEl.setText(`${this.jobPercent}%`);
+    if (fillEl instanceof HTMLElement) {
+      fillEl.setCssProps({ width: `${this.jobPercent}%` });
+    }
+  }
+
+  private addLabeledAction(
+    view: MarkdownView,
+    icon: string,
+    label: string,
+    tone: "publish" | "sync" | "link" | "unlink" | "tabs" | "create",
+    onClick: () => void,
+    opts?: { loading?: boolean; disabled?: boolean }
+  ) {
+    const el = view.addAction(icon, label, () => {
+      if (this.jobBusy || opts?.disabled) {
+        new Notice("Aguarde: operação em andamento.");
+        return;
+      }
+      onClick();
+    });
+    el.addClass("gdocs-hub-action");
+    el.addClass(`gdocs-hub-action-${tone}`);
+    if (opts?.loading) el.addClass("is-loading");
+    if (opts?.disabled || this.jobBusy) el.addClass("is-disabled");
+
+    const spinner = el.createSpan({ cls: "gdocs-hub-action-spinner" });
+    spinner.setAttr("aria-hidden", "true");
     el.createSpan({ text: label, cls: "gdocs-hub-action-label" });
 
     return el;
@@ -2710,34 +4671,121 @@ export default class GoogleDocsHubPlugin extends Plugin {
     if (!file) return;
 
     const docId = this.app.metadataCache.getFileCache(file)?.frontmatter?.[FRONTMATTER_DOC_ID_KEY];
+    const busy = this.jobBusy;
+    const updatingTabs = busy && this.jobKind === "tabs";
 
-    if (!docId) {
-      const linkAction = this.addLabeledAction(view, "link", "Link existing Doc", "#EA4335", () => {
-        new LinkDocModal(this.app, (url) => {
-          void linkNoteToDoc(this, file, url);
-        }).open();
-      });
-
-      this.docActionsByView.set(view, [linkAction]);
+    // Arquivo mapa: Atualizar guias (resolve Doc pelas notas irmas), sem Criar/Vincular
+    if (!docId && isHubMapaFile(this, file)) {
+      const canUpdate = !!resolveDocContextForTabUpdate(this, file);
+      const tabsAction = this.addLabeledAction(
+        view,
+        "layers",
+        updatingTabs ? "Atualizando…" : "Atualizar guias",
+        "tabs",
+        () => {
+          void updateGuiasFromLinkedNote(this, file);
+        },
+        { loading: updatingTabs, disabled: busy || !canUpdate }
+      );
+      this.docActionsByView.set(view, [tabsAction]);
       return;
     }
 
-    const publishAction = this.addLabeledAction(view, "upload-cloud", "Publish note", "#4285F4", () => {
-      void publishNoteCommand(this, file);
-    });
+    if (!docId) {
+      const createAction = this.addLabeledAction(
+        view,
+        "file-plus",
+        "Criar Doc",
+        "create",
+        () => {
+          void startCreateGoogleDocFlow(this, file);
+        },
+        { disabled: busy }
+      );
+      const linkAction = this.addLabeledAction(
+        view,
+        "link",
+        "Vincular Doc",
+        "link",
+        () => {
+          new LinkDocModal(this.app, (url) => {
+            void linkNoteToDoc(this, file, url);
+          }).open();
+        },
+        { disabled: busy }
+      );
+      this.docActionsByView.set(view, [createAction, linkAction]);
+      return;
+    }
 
-    const syncAction = this.addLabeledAction(view, "download-cloud", "Sync now", "#34A853", () => {
-      void syncNowCommand(this, file);
-    });
+    const publishing = busy && this.jobKind === "publish";
+    const syncing = busy && this.jobKind === "sync";
+    // Merge (modal de conflito) grava nos dois lados; animação só no Publicar pra nao parecer Puxar
+    const merging = busy && this.jobKind === "merge";
 
-    this.docActionsByView.set(view, [publishAction, syncAction]);
+    const publishAction = this.addLabeledAction(
+      view,
+      "upload-cloud",
+      publishing ? "Publicando…" : merging ? "Aplicando…" : "Publicar",
+      "publish",
+      () => {
+        void publishNoteCommand(this, file);
+      },
+      { loading: publishing || merging, disabled: busy }
+    );
+
+    const syncAction = this.addLabeledAction(
+      view,
+      "download-cloud",
+      syncing ? "Puxando…" : "Puxar Doc",
+      "sync",
+      () => {
+        void syncNowCommand(this, file);
+      },
+      { loading: syncing, disabled: busy }
+    );
+
+    const tabsAction = this.addLabeledAction(
+      view,
+      "layers",
+      updatingTabs ? "Atualizando…" : "Atualizar guias",
+      "tabs",
+      () => {
+        void updateGuiasFromLinkedNote(this, file);
+      },
+      { loading: updatingTabs, disabled: busy }
+    );
+
+    const unlinkAction = this.addLabeledAction(
+      view,
+      "unlink",
+      "Desvincular",
+      "unlink",
+      () => {
+        new ConfirmUnlinkModal(this.app, file.basename, async (ok) => {
+          if (!ok) return;
+          await clearNoteDocLink(this, file);
+          this.refreshUi();
+          new Notice("Nota desvinculada do Google Doc.");
+        }).open();
+      },
+      { disabled: busy }
+    );
+
+    this.docActionsByView.set(view, [publishAction, syncAction, tabsAction, unlinkAction]);
   }
 
   async saveSettings() {
     await this.saveData(this.settings);
   }
 
+  /** Atualiza botoes do header apos desvincular / mudar frontmatter. */
+  refreshUi() {
+    this.refreshDocActions();
+  }
+
   onunload() {
+    this.clearProgressBanner();
     this.docActionsByView.forEach((actions) => actions.forEach((el) => el.remove()));
     this.docActionsByView.clear();
   }
