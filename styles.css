@@ -1,0 +1,79 @@
+/* Google Docs Hub — estilos do plugin (evita assignment direto em element.style) */
+
+.gdocs-hub-diff-container {
+	max-height: 50vh;
+	overflow-y: auto;
+	font-family: var(--font-monospace);
+	font-size: 0.85em;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 6px;
+	padding: 8px;
+}
+
+.gdocs-hub-diff-context {
+	white-space: pre-wrap;
+	opacity: 0.6;
+}
+
+.gdocs-hub-diff-hunk {
+	margin: 6px 0;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 4px;
+	padding: 4px;
+}
+
+.gdocs-hub-diff-local {
+	white-space: pre-wrap;
+	background: rgba(248, 81, 73, 0.15);
+}
+
+.gdocs-hub-diff-remote {
+	white-space: pre-wrap;
+	background: rgba(63, 185, 80, 0.15);
+}
+
+.gdocs-hub-diff-controls {
+	margin-top: 4px;
+	display: flex;
+	gap: 6px;
+}
+
+.gdocs-hub-full-width {
+	width: 100%;
+}
+
+.gdocs-hub-scroll-list {
+	max-height: 50vh;
+	overflow-y: auto;
+}
+
+.gdocs-hub-block-button {
+	display: block;
+	width: 100%;
+	margin-bottom: 6px;
+	text-align: left;
+}
+
+.gdocs-hub-block-button-spaced {
+	display: block;
+	width: 100%;
+	margin-bottom: 8px;
+}
+
+.gdocs-hub-back-button {
+	margin-top: 8px;
+}
+
+.gdocs-hub-action {
+	color: var(--gdocs-hub-action-color);
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	width: auto;
+	white-space: nowrap;
+}
+
+.gdocs-hub-action-label {
+	font-size: 0.7em;
+	color: var(--text-muted);
+}

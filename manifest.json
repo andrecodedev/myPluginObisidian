@@ -1,8 +1,8 @@
 {
   "id": "google-docs-hub",
   "name": "Google Docs Hub",
-  "version": "0.1.0",
-  "minAppVersion": "1.4.0",
+  "version": "0.1.1",
+  "minAppVersion": "1.4.4",
   "description": "Um Google Doc como hub central: varios vaults sincronizam o mesmo Doc, e voce pode linkar um Doc ja existente (nao so criar).",
   "author": "Andre Vitor",
   "isDesktopOnly": true

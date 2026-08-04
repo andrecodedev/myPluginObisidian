@@ -1,7 +1,25 @@
-import { App, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile } from "obsidian";
+import {
+  App,
+  MarkdownView,
+  Modal,
+  Notice,
+  Plugin,
+  PluginSettingTab,
+  Setting,
+  TFile,
+  requestUrl,
+} from "obsidian";
 import { randomBytes, createHash } from "crypto";
 import * as http from "http";
 import { shell } from "electron";
+
+/** Resposta minimalista compatível com o uso antigo de fetch no código Google API. */
+interface GoogleHttpResponse {
+  ok: boolean;
+  status: number;
+  json: () => Promise<unknown>;
+  text: () => Promise<string>;
+}
 
 const FRONTMATTER_DOC_ID_KEY = "google_doc_id";
 const FRONTMATTER_DOC_URL_KEY = "google_doc_url";
@@ -945,13 +963,14 @@ async function runGoogleOAuthFlow(clientId: string, clientSecret: string): Promi
       shell.openExternal(authUrl.toString());
     });
 
-    setTimeout(() => {
+    window.setTimeout(() => {
       server.close();
       reject(new Error("Tempo esgotado esperando a autorizacao do Google."));
     }, OAUTH_TIMEOUT_MS);
   });
 
-  const tokenResponse = await fetch(GOOGLE_TOKEN_URL, {
+  const tokenResponse = await requestUrl({
+    url: GOOGLE_TOKEN_URL,
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
@@ -962,15 +981,20 @@ async function runGoogleOAuthFlow(clientId: string, clientSecret: string): Promi
       grant_type: "authorization_code",
       code_verifier: verifier,
     }).toString(),
+    throw: false,
   });
 
-  if (!tokenResponse.ok) {
+  if (tokenResponse.status < 200 || tokenResponse.status >= 300) {
     throw new Error(`Falha ao trocar o code por tokens (HTTP ${tokenResponse.status}).`);
   }
 
-  const tokenData = await tokenResponse.json();
+  const tokenData = tokenResponse.json as {
+    access_token?: string;
+    refresh_token?: string;
+    expires_in?: number;
+  };
 
-  if (!tokenData.refresh_token) {
+  if (!tokenData.refresh_token || !tokenData.access_token || tokenData.expires_in == null) {
     throw new Error(
       "Google nao retornou refresh_token. Revogue o acesso em myaccount.google.com/permissions e tente de novo."
     );
@@ -997,7 +1021,8 @@ async function ensureFreshAccessToken(plugin: GoogleDocsHubPlugin): Promise<stri
     throw new Error("Conta Google nao conectada. Rode o comando Connect Google account primeiro.");
   }
 
-  const response = await fetch(GOOGLE_TOKEN_URL, {
+  const response = await requestUrl({
+    url: GOOGLE_TOKEN_URL,
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
@@ -1006,13 +1031,17 @@ async function ensureFreshAccessToken(plugin: GoogleDocsHubPlugin): Promise<stri
       refresh_token: refreshToken,
       grant_type: "refresh_token",
     }).toString(),
+    throw: false,
   });
 
-  if (!response.ok) {
+  if (response.status < 200 || response.status >= 300) {
     throw new Error(`Falha ao renovar o token de acesso (HTTP ${response.status}). Tente reconectar a conta.`);
   }
 
-  const data = await response.json();
+  const data = response.json as { access_token?: string; expires_in?: number };
+  if (!data.access_token || data.expires_in == null) {
+    throw new Error("Falha ao renovar o token de acesso: resposta invalida do Google.");
+  }
 
   plugin.settings.accessToken = data.access_token;
   plugin.settings.accessTokenExpiresAt = Date.now() + data.expires_in * 1000;
@@ -1021,15 +1050,29 @@ async function ensureFreshAccessToken(plugin: GoogleDocsHubPlugin): Promise<stri
   return plugin.settings.accessToken as string;
 }
 
-async function googleApiFetch(plugin: GoogleDocsHubPlugin, url: string, options: RequestInit = {}): Promise<Response> {
+async function googleApiFetch(
+  plugin: GoogleDocsHubPlugin,
+  url: string,
+  options: { method?: string; headers?: Record<string, string>; body?: string } = {}
+): Promise<GoogleHttpResponse> {
   const accessToken = await ensureFreshAccessToken(plugin);
-  return fetch(url, {
-    ...options,
+  const response = await requestUrl({
+    url,
+    method: options.method ?? "GET",
     headers: {
       ...(options.headers ?? {}),
       Authorization: `Bearer ${accessToken}`,
     },
+    body: options.body,
+    throw: false,
   });
+
+  return {
+    ok: response.status >= 200 && response.status < 300,
+    status: response.status,
+    json: async () => response.json,
+    text: async () => response.text,
+  };
 }
 
 // includeTabsContent=true e obrigatorio pra API devolver o conteudo de TODAS as guias do Doc,
@@ -1951,51 +1994,34 @@ class MergeReviewModal extends Modal {
 
   onOpen() {
     const { contentEl } = this;
-    contentEl.createEl("h2", { text: "Revisar diferencas antes de continuar" });
+    new Setting(contentEl).setName("Revisar diferencas antes de continuar").setHeading();
     contentEl.createEl("p", {
       text: "A nota e o Google Doc mudaram desde a ultima sincronizacao. Escolha o que fica em cada trecho destacado.",
     });
 
-    const diffContainer = contentEl.createDiv();
-    diffContainer.style.maxHeight = "50vh";
-    diffContainer.style.overflowY = "auto";
-    diffContainer.style.fontFamily = "monospace";
-    diffContainer.style.fontSize = "0.85em";
-    diffContainer.style.border = "1px solid var(--background-modifier-border)";
-    diffContainer.style.borderRadius = "6px";
-    diffContainer.style.padding = "8px";
+    const diffContainer = contentEl.createDiv({ cls: "gdocs-hub-diff-container" });
 
     this.hunks.forEach((hunk, index) => {
       if (hunk.kind === "same") {
         for (const line of hunk.lines) {
-          const lineEl = diffContainer.createDiv({ text: line.length > 0 ? line : " " });
-          lineEl.style.whiteSpace = "pre-wrap";
-          lineEl.style.opacity = "0.6";
+          diffContainer.createDiv({
+            text: line.length > 0 ? line : " ",
+            cls: "gdocs-hub-diff-context",
+          });
         }
         return;
       }
 
-      const hunkEl = diffContainer.createDiv();
-      hunkEl.style.margin = "6px 0";
-      hunkEl.style.border = "1px solid var(--background-modifier-border)";
-      hunkEl.style.borderRadius = "4px";
-      hunkEl.style.padding = "4px";
+      const hunkEl = diffContainer.createDiv({ cls: "gdocs-hub-diff-hunk" });
 
       for (const line of hunk.localLines) {
-        const lineEl = hunkEl.createDiv({ text: `- ${line}` });
-        lineEl.style.whiteSpace = "pre-wrap";
-        lineEl.style.background = "rgba(248, 81, 73, 0.15)";
+        hunkEl.createDiv({ text: `- ${line}`, cls: "gdocs-hub-diff-local" });
       }
       for (const line of hunk.remoteLines) {
-        const lineEl = hunkEl.createDiv({ text: `+ ${line}` });
-        lineEl.style.whiteSpace = "pre-wrap";
-        lineEl.style.background = "rgba(63, 185, 80, 0.15)";
+        hunkEl.createDiv({ text: `+ ${line}`, cls: "gdocs-hub-diff-remote" });
       }
 
-      const controls = hunkEl.createDiv();
-      controls.style.marginTop = "4px";
-      controls.style.display = "flex";
-      controls.style.gap = "6px";
+      const controls = hunkEl.createDiv({ cls: "gdocs-hub-diff-controls" });
 
       const options: Array<{ value: HunkChoice; label: string }> = [
         { value: "local", label: "Manter a nota" },
@@ -2089,7 +2115,7 @@ async function publishNoteCommand(plugin: GoogleDocsHubPlugin, file: TFile): Pro
         content,
         remoteContent,
         (merged) => {
-          applyMergedContent(plugin, file, docId, merged, tabId);
+          void applyMergedContent(plugin, file, docId, merged, tabId);
         },
         "local"
       ).open();
@@ -2133,7 +2159,7 @@ async function syncNowCommand(plugin: GoogleDocsHubPlugin, file: TFile): Promise
         localContent,
         remoteContent,
         (merged) => {
-          applyMergedContent(plugin, file, docId, merged, tabId);
+          void applyMergedContent(plugin, file, docId, merged, tabId);
         },
         "remote"
       ).open();
@@ -2168,14 +2194,14 @@ class LinkDocModal extends Modal {
 
   onOpen() {
     const { contentEl } = this;
-    contentEl.createEl("h2", { text: this.modalTitle });
+    new Setting(contentEl).setName(this.modalTitle).setHeading();
     contentEl.createEl("p", { text: this.modalDescription });
 
     const input = contentEl.createEl("input", {
       type: "text",
       placeholder: "https://docs.google.com/document/d/....",
+      cls: "gdocs-hub-full-width",
     });
-    input.style.width = "100%";
     input.focus();
 
     const submit = () => {
@@ -2219,19 +2245,13 @@ class TabSelectionModal extends Modal {
 
   onOpen() {
     const { contentEl } = this;
-    contentEl.createEl("h2", { text: "Esse Doc tem varias guias" });
+    new Setting(contentEl).setName("Esse Doc tem varias guias").setHeading();
     contentEl.createEl("p", { text: "Escolha qual guia essa nota deve sincronizar." });
 
-    const listEl = contentEl.createDiv();
-    listEl.style.maxHeight = "50vh";
-    listEl.style.overflowY = "auto";
+    const listEl = contentEl.createDiv({ cls: "gdocs-hub-scroll-list" });
 
     for (const tab of this.tabs) {
-      const button = listEl.createEl("button", { text: tab.title });
-      button.style.display = "block";
-      button.style.width = "100%";
-      button.style.marginBottom = "6px";
-      button.style.textAlign = "left";
+      const button = listEl.createEl("button", { text: tab.title, cls: "gdocs-hub-block-button" });
       button.addEventListener("click", () => {
         this.close();
         this.onSelect(tab.tabId);
@@ -2239,8 +2259,7 @@ class TabSelectionModal extends Modal {
     }
 
     if (this.onBack) {
-      const backButton = contentEl.createEl("button", { text: "Voltar" });
-      backButton.style.marginTop = "8px";
+      const backButton = contentEl.createEl("button", { text: "Voltar", cls: "gdocs-hub-back-button" });
       backButton.addEventListener("click", () => {
         this.close();
         this.onBack?.();
@@ -2267,16 +2286,13 @@ class TabChoiceModal extends Modal {
 
   onOpen() {
     const { contentEl } = this;
-    contentEl.createEl("h2", { text: "Esse Doc tem varias guias" });
+    new Setting(contentEl).setName("Esse Doc tem varias guias").setHeading();
     contentEl.createEl("p", { text: "O que voce quer fazer?" });
 
     const importButton = contentEl.createEl("button", {
       text: "Importar todas as guias (uma nota por guia)",
-      cls: "mod-cta",
+      cls: "mod-cta gdocs-hub-block-button-spaced",
     });
-    importButton.style.display = "block";
-    importButton.style.width = "100%";
-    importButton.style.marginBottom = "8px";
     importButton.addEventListener("click", () => {
       this.close();
       this.onImportAll();
@@ -2284,9 +2300,8 @@ class TabChoiceModal extends Modal {
 
     const selectButton = contentEl.createEl("button", {
       text: "Vincular esta nota a uma guia especifica",
+      cls: "gdocs-hub-block-button",
     });
-    selectButton.style.display = "block";
-    selectButton.style.width = "100%";
     selectButton.addEventListener("click", () => {
       this.close();
       this.onSelectOne();
@@ -2340,7 +2355,7 @@ async function linkNoteToDoc(plugin: GoogleDocsHubPlugin, file: TFile, url: stri
             plugin.app,
             defaultFolder,
             (folderPath) => {
-              runImportAllTabs(plugin, doc, docId, url, tabs, folderPath);
+              void runImportAllTabs(plugin, doc, docId, url, tabs, folderPath);
             },
             showChoice
           ).open();
@@ -2349,8 +2364,8 @@ async function linkNoteToDoc(plugin: GoogleDocsHubPlugin, file: TFile, url: stri
           new TabSelectionModal(
             plugin.app,
             tabs,
-            async (tabId) => {
-              await saveLink(tabId);
+            (tabId) => {
+              void saveLink(tabId);
             },
             showChoice
           ).open();
@@ -2388,14 +2403,13 @@ class ImportFolderModal extends Modal {
 
   onOpen() {
     const { contentEl } = this;
-    contentEl.createEl("h2", { text: "Importar todas as guias" });
+    new Setting(contentEl).setName("Importar todas as guias").setHeading();
     contentEl.createEl("p", {
       text: "Em qual pasta do vault as notas devem ser criadas (uma nota por guia)?",
     });
 
-    const input = contentEl.createEl("input", { type: "text" });
+    const input = contentEl.createEl("input", { type: "text", cls: "gdocs-hub-full-width" });
     input.value = this.defaultPath;
-    input.style.width = "100%";
     input.focus();
 
     const submit = () => {
@@ -2485,7 +2499,7 @@ function openImportAllTabsModal(plugin: GoogleDocsHubPlugin): void {
   new LinkDocModal(
     plugin.app,
     (url) => {
-      importAllTabsAsNotes(plugin, url);
+      void importAllTabsAsNotes(plugin, url);
     },
     {
       title: "Importar todas as guias do Doc",
@@ -2517,7 +2531,7 @@ async function importAllTabsAsNotes(plugin: GoogleDocsHubPlugin, url: string): P
     const defaultFolder = sanitizeFileName(doc.title || "Google Docs Import");
 
     new ImportFolderModal(plugin.app, defaultFolder, (folderPath) => {
-      runImportAllTabs(plugin, doc, docId, url, tabs, folderPath);
+      void runImportAllTabs(plugin, doc, docId, url, tabs, folderPath);
     }).open();
   } catch (err) {
     console.error(err);
@@ -2537,7 +2551,7 @@ class GoogleDocsHubSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    containerEl.createEl("h2", { text: "Google Docs Hub" });
+    new Setting(containerEl).setName("Google Docs Hub").setHeading();
 
     new Setting(containerEl)
       .setName("Client ID")
@@ -2615,7 +2629,7 @@ export default class GoogleDocsHubPlugin extends Plugin {
           new Notice("Abra uma nota antes de publicar.");
           return;
         }
-        publishNoteCommand(this, file);
+        void publishNoteCommand(this, file);
       },
     });
 
@@ -2630,7 +2644,7 @@ export default class GoogleDocsHubPlugin extends Plugin {
         }
 
         new LinkDocModal(this.app, (url) => {
-          linkNoteToDoc(this, file, url);
+          void linkNoteToDoc(this, file, url);
         }).open();
       },
     });
@@ -2654,7 +2668,7 @@ export default class GoogleDocsHubPlugin extends Plugin {
           new Notice("Abra uma nota antes de sincronizar.");
           return;
         }
-        syncNowCommand(this, file);
+        void syncNowCommand(this, file);
       },
     });
 
@@ -2674,16 +2688,10 @@ export default class GoogleDocsHubPlugin extends Plugin {
   // aqui a gente anexa um <span> de texto manualmente porque foi pedido explicitamente)
   private addLabeledAction(view: MarkdownView, icon: string, label: string, color: string, onClick: () => void) {
     const el = view.addAction(icon, label, onClick);
-    el.style.color = color;
-    el.style.display = "inline-flex";
-    el.style.alignItems = "center";
-    el.style.gap = "4px";
-    el.style.width = "auto";
-    el.style.whiteSpace = "nowrap";
+    el.addClass("gdocs-hub-action");
+    el.setCssProps({ "--gdocs-hub-action-color": color });
 
-    const textSpan = el.createSpan({ text: label });
-    textSpan.style.fontSize = "0.7em";
-    textSpan.style.color = "var(--text-muted)";
+    el.createSpan({ text: label, cls: "gdocs-hub-action-label" });
 
     return el;
   }
@@ -2706,7 +2714,7 @@ export default class GoogleDocsHubPlugin extends Plugin {
     if (!docId) {
       const linkAction = this.addLabeledAction(view, "link", "Link existing Doc", "#EA4335", () => {
         new LinkDocModal(this.app, (url) => {
-          linkNoteToDoc(this, file, url);
+          void linkNoteToDoc(this, file, url);
         }).open();
       });
 
@@ -2715,11 +2723,11 @@ export default class GoogleDocsHubPlugin extends Plugin {
     }
 
     const publishAction = this.addLabeledAction(view, "upload-cloud", "Publish note", "#4285F4", () => {
-      publishNoteCommand(this, file);
+      void publishNoteCommand(this, file);
     });
 
     const syncAction = this.addLabeledAction(view, "download-cloud", "Sync now", "#34A853", () => {
-      syncNowCommand(this, file);
+      void syncNowCommand(this, file);
     });
 
     this.docActionsByView.set(view, [publishAction, syncAction]);
